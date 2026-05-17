@@ -8,7 +8,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star
 from astrbot.api import logger, AstrBotConfig
 
-from zhixue import (
+from zhixue_core import (
     zhixue_manager,
     load_bindings,
     format_exams_table,
