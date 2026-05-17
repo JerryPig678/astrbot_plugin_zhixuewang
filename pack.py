@@ -6,7 +6,7 @@ output_zip = os.path.join(os.path.dirname(base_dir), "astrbot_plugin_zhixuewang.
 plugin_name = "astrbot_plugin_zhixuewang"
 
 exclude_dirs = {".git", "__pycache__"}
-exclude_files = {".gitignore", ".gitkeep", "astrbot_plugin_zhixuewang.zip", "pack.py"}
+exclude_files = {".gitignore", ".gitkeep", "astrbot_plugin_zhixuewang.zip", "pack.py", "geeked.py"}
 
 with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as zf:
     info = zipfile.ZipInfo(plugin_name + "/")
