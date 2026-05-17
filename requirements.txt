@@ -1,0 +1,8 @@
+zhixuewang>=1.5.0
+playwright>=1.40.0
+curl_cffi>=0.10.0
+ddddocr
+opencv-python>=4.10.0
+numpy>=2.0.0
+pycryptodome>=3.21.0
+requests>=2.32.0

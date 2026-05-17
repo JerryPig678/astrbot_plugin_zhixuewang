@@ -1,0 +1,393 @@
+import asyncio
+import json
+import os
+import re
+import random
+import time
+
+import requests as req_sync
+from zhixuewang import login_cookie
+
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(PLUGIN_DIR, "data")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+SCORES_FILE = os.path.join(DATA_DIR, "scores.json")
+COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
+WATCH_CONFIG_FILE = os.path.join(DATA_DIR, "watch_config.json")
+
+CAPTCHA_ID = "a6474422e78e5bb048082ec77d141068"
+MAX_RETRIES = 8
+
+
+def load_users() -> dict:
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_users(users: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+
+def _cookie_file(user_id: str) -> str:
+    safe = "".join(c if c.isalnum() else "_" for c in user_id)
+    return os.path.join(COOKIES_DIR, f"{safe}.json")
+
+
+def load_cookies(user_id: str) -> dict | None:
+    cf = _cookie_file(user_id)
+    if os.path.exists(cf):
+        with open(cf, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def save_cookies(user_id: str, cookies: dict):
+    os.makedirs(COOKIES_DIR, exist_ok=True)
+    with open(_cookie_file(user_id), "w", encoding="utf-8") as f:
+        json.dump(cookies, f, ensure_ascii=False, indent=2)
+
+
+def load_scores() -> dict:
+    if os.path.exists(SCORES_FILE):
+        with open(SCORES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_scores(scores: dict):
+    with open(SCORES_FILE, "w", encoding="utf-8") as f:
+        json.dump(scores, f, ensure_ascii=False, indent=2)
+
+
+def load_watch_config() -> dict:
+    if os.path.exists(WATCH_CONFIG_FILE):
+        with open(WATCH_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"enabled": False, "interval": 300, "group_umo": ""}
+
+
+def save_watch_config(cfg: dict):
+    with open(WATCH_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _detect_type(data: dict) -> str:
+    if "bg" in data:
+        return "slide"
+    if "imgs" in data:
+        return "icon"
+    if isinstance(data.get("ques"), list) and data["ques"] and isinstance(data["ques"][0], list):
+        return "gobang"
+    return "ai"
+
+
+async def playwright_login(username: str, password: str, print_fn=None) -> dict:
+    from playwright.async_api import async_playwright
+    from geeked.sign import Signer
+    from geeked.slide import SlideSolver
+    from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
+
+    def log(msg):
+        if print_fn:
+            print_fn(msg)
+        else:
+            print(msg)
+
+    load_data = None
+    captcha_type = None
+    browser_captcha_id = None
+
+    async def handle_load(route):
+        nonlocal load_data, captcha_type, browser_captcha_id
+        url = route.request.url
+        if "captcha_id" not in url:
+            await route.continue_()
+            return
+        m = re.search(r"captcha_id=([a-f0-9]+)", url)
+        if m:
+            browser_captcha_id = m.group(1)
+        response = await route.fetch()
+        body = await response.text()
+        json_match = re.search(r"\((\{.*\})\)\s*$", body, re.DOTALL)
+        if json_match:
+            jsonp_data = json.loads(json_match.group(1))
+            load_data = jsonp_data.get("data", jsonp_data)
+            captcha_type = _detect_type(load_data)
+        await route.fulfill(response=response)
+
+    async def handle_verify(route):
+        nonlocal load_data, captcha_type, browser_captcha_id
+        try:
+            url = route.request.url
+            parsed = urlparse(url)
+            params = dict(parse_qs(parsed.query))
+            params = {k: v[0] for k, v in params.items()}
+            w = Signer.generate_w(load_data, browser_captcha_id, captcha_type)
+            params["w"] = w
+            new_query = urlencode(params)
+            new_url = urlunparse(parsed._replace(query=new_query))
+            response = await route.fetch(url=new_url)
+            await route.fulfill(response=response)
+        except Exception as e:
+            log(f"    [verify] 失败: {e}")
+            await route.continue_()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled",
+                  "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+        )
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        """)
+        page = await context.new_page()
+        await page.route("**/xunfei.geetest.com/load*", handle_load)
+        await page.route("**/xunfei.geetest.com/verify*", handle_verify)
+
+        login_success = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            load_data = None
+            captcha_type = None
+            browser_captcha_id = None
+            log(f"    第{attempt}/{MAX_RETRIES}次尝试...")
+            await page.goto("https://www.zhixue.com/wap_login.html", wait_until="networkidle")
+            await page.fill("#txtUserName", username)
+            await page.fill("#txtPassword", password)
+            await asyncio.sleep(0.5)
+            await page.click("#signup_button")
+            await asyncio.sleep(3)
+
+            if captcha_type and captcha_type != "slide":
+                log(f"    非slide({captcha_type})，重试...")
+                continue
+
+            if captcha_type == "slide":
+                bg_url = f"https://static.geetest.com/{load_data['bg']}"
+                slice_url = f"https://static.geetest.com/{load_data['slice']}"
+                bg_img = req_sync.get(bg_url, timeout=15).content
+                slice_img = req_sync.get(slice_url, timeout=15).content
+                distance = SlideSolver(slice_img, bg_img).find_puzzle_piece_position()
+                log(f"    slide distance={distance:.1f}")
+
+                slider = None
+                box = None
+                for sel in [".geetest_btn", ".geetest_slider_button",
+                            "[class*='slider_button']", "[class*='geetest_slider']"]:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0:
+                            b = await loc.bounding_box()
+                            if b and b["width"] > 10 and b["height"] > 10:
+                                slider = loc
+                                box = b
+                                break
+                    except Exception:
+                        continue
+
+                if slider and box:
+                    sx = box["x"] + box["width"] / 2
+                    sy = box["y"] + box["height"] / 2
+                    await page.mouse.move(sx, sy)
+                    await page.mouse.down()
+                    steps = random.randint(30, 50)
+                    for i in range(1, steps + 1):
+                        p = i / steps
+                        await page.mouse.move(
+                            sx + distance * (p * (2 - p)),
+                            sy + random.uniform(-2, 2)
+                        )
+                        await asyncio.sleep(random.uniform(0.005, 0.015))
+                    await page.mouse.move(sx + distance + random.uniform(0, 3),
+                                          sy + random.uniform(-1, 1))
+                    await page.mouse.up()
+                    await asyncio.sleep(3)
+
+            try:
+                await page.wait_for_url("https://www.zhixue.com/htm-vessel/**", timeout=90000)
+                login_success = True
+                break
+            except Exception:
+                continue
+
+        cookies = await page.context.cookies()
+        cookies_dict = {c.get("name"): c.get("value") for c in cookies}
+        cookies_dict["loginUserName"] = username
+        await browser.close()
+
+        if not login_success:
+            raise RuntimeError("Playwright登录失败，浏览器未能跳转到目标页面")
+
+        return cookies_dict
+
+
+class ZhiXueManager:
+    def __init__(self, log_fn=None):
+        self.log = log_fn or print
+        self._playwright_lock = asyncio.Lock()
+
+    def get_registered_users(self) -> dict:
+        return load_users()
+
+    def register_user(self, qq_id: str, username: str, password: str):
+        users = load_users()
+        users[qq_id] = {"username": username, "password": password}
+        save_users(users)
+
+    def remove_user(self, qq_id: str):
+        users = load_users()
+        if qq_id in users:
+            del users[qq_id]
+            save_users(users)
+        cf = _cookie_file(qq_id)
+        if os.path.exists(cf):
+            os.remove(cf)
+
+    async def get_account(self, qq_id: str) -> tuple:
+        users = load_users()
+        if qq_id not in users:
+            raise ValueError("未绑定账号，请先使用 /zx bind <用户名> <密码> 绑定")
+        u = users[qq_id]
+        username = u["username"]
+        password = u["password"]
+
+        cookies = load_cookies(qq_id)
+        if cookies:
+            try:
+                account = login_cookie(cookies)
+                return account, "cookie"
+            except Exception:
+                self.log(f"    用户 {qq_id} 旧Cookie失效，重新登录...")
+
+        self.log(f"    用户 {qq_id} 启动Playwright登录...")
+        async with self._playwright_lock:
+            new_cookies = await playwright_login(username, password, print_fn=self.log)
+            save_cookies(qq_id, new_cookies)
+            account = login_cookie(new_cookies)
+            return account, "playwright"
+
+    async def get_exams(self, qq_id: str) -> list:
+        account, method = await self.get_account(qq_id)
+        exams = account.get_exams()
+        result = []
+        for exam in exams:
+            result.append({
+                "id": getattr(exam, "id", ""),
+                "name": getattr(exam, "name", str(exam)),
+                "is_final": getattr(exam, "is_final", False),
+                "grade_code": getattr(exam, "grade_code", ""),
+            })
+        return result
+
+    async def get_marks(self, qq_id: str, exam_name: str = None) -> tuple:
+        account, method = await self.get_account(qq_id)
+        user_name = account.name
+        if exam_name:
+            exam = None
+            for e in account.get_exams():
+                en = getattr(e, "name", str(e))
+                if exam_name in en:
+                    exam = e
+                    break
+            if exam is None:
+                raise ValueError(f"未找到考试: {exam_name}")
+            marks = account.get_self_mark(exam)
+        else:
+            marks = account.get_self_mark()
+        subjects = []
+        if marks:
+            for m in marks:
+                subjects.append({
+                    "subject": getattr(m.subject, "name", getattr(m, "subject_name", "未知")),
+                    "score": getattr(m, "score", None),
+                    "standard_score": getattr(m, "standard_score", None),
+                    "class_rank": getattr(m, "class_rank", None),
+                    "grade_rank": getattr(m, "grade_rank", None),
+                })
+        exam_info = {}
+        if marks and len(marks) > 0:
+            e = getattr(marks[0], "exam", None)
+            if e:
+                exam_info = {"name": getattr(e, "name", "未知"), "id": getattr(e, "id", "")}
+            else:
+                exam_info = exam_name and {"name": exam_name} or {}
+        return user_name, exam_info, subjects
+
+    async def check_new_scores(self, qq_id: str) -> list:
+        account, method = await self.get_account(qq_id)
+        all_scores = load_scores()
+        user_scores = all_scores.get(qq_id, {})
+
+        new_items = []
+        try:
+            marks = account.get_self_mark()
+            if marks:
+                e = getattr(marks[0], "exam", None)
+                exam_name = getattr(e, "name", "") if e else "latest"
+                if exam_name not in user_scores:
+                    subs = []
+                    for m in marks:
+                        subs.append({
+                            "subject": getattr(m.subject, "name", "?"),
+                            "score": getattr(m, "score", None),
+                        })
+                    new_items.append({"exam": exam_name, "subjects": subs})
+                    user_scores[exam_name] = {"timestamp": time.time()}
+                    all_scores[qq_id] = user_scores
+                    save_scores(all_scores)
+        except Exception:
+            pass
+
+        return new_items
+
+    async def get_latest_marks(self, qq_id: str) -> tuple:
+        return await self.get_marks(qq_id, exam_name=None)
+
+
+zhixue_manager = ZhiXueManager()
+
+
+def format_exams_table(exams: list) -> str:
+    if not exams:
+        return "暂无考试数据"
+    lines = ["考试列表：", ""]
+    for i, e in enumerate(exams, 1):
+        name = e.get("name", "?")
+        is_final = " [期末]" if e.get("is_final") else ""
+        lines.append(f"  {i}. {name}{is_final}")
+    lines.append("")
+    lines.append("发送 /zx marks <考试名> 查询对应成绩")
+    return "\n".join(lines)
+
+
+
+
+def format_marks_table(user_name: str, exam_name: str, subjects: list) -> str:
+    if not subjects:
+        return f"{user_name} 暂无 {exam_name} 成绩数据"
+    lines = [f"【{user_name}】 {exam_name}"]
+    total = 0
+    count = 0
+    for s in subjects:
+        subj = s.get("subject", "?")
+        score = s.get("score")
+        score_str = f"{score:.1f}" if score is not None else "-"
+        extra = []
+        if s.get("class_rank"):
+            extra.append(f"班排{s['class_rank']}")
+        extra_str = f" ({', '.join(extra)})" if extra else ""
+        lines.append(f"  {subj}: {score_str}{extra_str}")
+        if score is not None:
+            total += score
+            count += 1
+    if count > 0:
+        lines.append(f"  总分: {total:.1f}")
+    return "\n".join(lines)
