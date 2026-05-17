@@ -4,51 +4,54 @@ import os
 import re
 import random
 import time
+import hashlib
 
-import requests as req_sync
+import httpx
 from zhixuewang import login_cookie
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
+BINDINGS_FILE = os.path.join(DATA_DIR, "bindings.json")
 SCORES_FILE = os.path.join(DATA_DIR, "scores.json")
 COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
-WATCH_CONFIG_FILE = os.path.join(DATA_DIR, "watch_config.json")
 
 CAPTCHA_ID = "a6474422e78e5bb048082ec77d141068"
 MAX_RETRIES = 8
 
 
-def load_users() -> dict:
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def _safe_name(username: str) -> str:
+    return hashlib.md5(username.encode()).hexdigest()[:16]
 
 
-def save_users(users: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+def _cookie_file(username: str) -> str:
+    return os.path.join(COOKIES_DIR, f"{_safe_name(username)}.json")
 
 
-def _cookie_file(user_id: str) -> str:
-    safe = "".join(c if c.isalnum() else "_" for c in user_id)
-    return os.path.join(COOKIES_DIR, f"{safe}.json")
-
-
-def load_cookies(user_id: str) -> dict | None:
-    cf = _cookie_file(user_id)
+def load_cookies_for(username: str) -> dict | None:
+    cf = _cookie_file(username)
     if os.path.exists(cf):
         with open(cf, "r", encoding="utf-8") as f:
             return json.load(f)
     return None
 
 
-def save_cookies(user_id: str, cookies: dict):
+def save_cookies_for(username: str, cookies: dict):
     os.makedirs(COOKIES_DIR, exist_ok=True)
-    with open(_cookie_file(user_id), "w", encoding="utf-8") as f:
+    with open(_cookie_file(username), "w", encoding="utf-8") as f:
         json.dump(cookies, f, ensure_ascii=False, indent=2)
+
+
+def load_bindings() -> dict:
+    if os.path.exists(BINDINGS_FILE):
+        with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_bindings(bindings: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(BINDINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(bindings, f, ensure_ascii=False, indent=2)
 
 
 def load_scores() -> dict:
@@ -61,18 +64,6 @@ def load_scores() -> dict:
 def save_scores(scores: dict):
     with open(SCORES_FILE, "w", encoding="utf-8") as f:
         json.dump(scores, f, ensure_ascii=False, indent=2)
-
-
-def load_watch_config() -> dict:
-    if os.path.exists(WATCH_CONFIG_FILE):
-        with open(WATCH_CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"enabled": False, "interval": 300, "group_umo": ""}
-
-
-def save_watch_config(cfg: dict):
-    with open(WATCH_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
 def _detect_type(data: dict) -> str:
@@ -94,8 +85,6 @@ async def playwright_login(username: str, password: str, print_fn=None) -> dict:
     def log(msg):
         if print_fn:
             print_fn(msg)
-        else:
-            print(msg)
 
     load_data = None
     captcha_type = None
@@ -173,8 +162,8 @@ async def playwright_login(username: str, password: str, print_fn=None) -> dict:
             if captcha_type == "slide":
                 bg_url = f"https://static.geetest.com/{load_data['bg']}"
                 slice_url = f"https://static.geetest.com/{load_data['slice']}"
-                bg_img = req_sync.get(bg_url, timeout=15).content
-                slice_img = req_sync.get(slice_url, timeout=15).content
+                bg_img = httpx.get(bg_url, timeout=15).content
+                slice_img = httpx.get(slice_url, timeout=15).content
                 distance = SlideSolver(slice_img, bg_img).find_puzzle_piece_position()
                 log(f"    slide distance={distance:.1f}")
 
@@ -224,7 +213,7 @@ async def playwright_login(username: str, password: str, print_fn=None) -> dict:
         await browser.close()
 
         if not login_success:
-            raise RuntimeError("Playwright登录失败，浏览器未能跳转到目标页面")
+            raise RuntimeError("Playwright登录失败")
 
         return cookies_dict
 
@@ -234,48 +223,79 @@ class ZhiXueManager:
         self.log = log_fn or print
         self._playwright_lock = asyncio.Lock()
 
-    def get_registered_users(self) -> dict:
-        return load_users()
+    def _get_user_config(self, username: str) -> dict | None:
+        raise NotImplementedError
 
-    def register_user(self, qq_id: str, username: str, password: str):
-        users = load_users()
-        users[qq_id] = {"username": username, "password": password}
-        save_users(users)
+    def _find_username(self, qq_id: str) -> str | None:
+        bindings = load_bindings()
+        return bindings.get(qq_id)
 
-    def remove_user(self, qq_id: str):
-        users = load_users()
-        if qq_id in users:
-            del users[qq_id]
-            save_users(users)
-        cf = _cookie_file(qq_id)
-        if os.path.exists(cf):
-            os.remove(cf)
+    def _find_credential(self, username: str, config_users: list) -> tuple | None:
+        for u in config_users:
+            if u.get("username") == username:
+                return username, u.get("password", "")
+        return None
 
-    async def get_account(self, qq_id: str) -> tuple:
-        users = load_users()
-        if qq_id not in users:
-            raise ValueError("未绑定账号，请先使用 /zx bind <用户名> <密码> 绑定")
-        u = users[qq_id]
-        username = u["username"]
-        password = u["password"]
+    def bound_users_count(self, config_users: list) -> int:
+        bindings = load_bindings()
+        count = 0
+        usernames = {u.get("username") for u in config_users}
+        for qq_id, username in bindings.items():
+            if username in usernames:
+                count += 1
+        return count
 
-        cookies = load_cookies(qq_id)
+    def get_bindings_info(self, config_users: list) -> list:
+        bindings = load_bindings()
+        usernames = {u.get("username"): u for u in config_users}
+        result = []
+        for qq_id, username in bindings.items():
+            result.append((qq_id, username, username in usernames))
+        return result
+
+    def bind_user(self, qq_id: str, username: str, config_users: list) -> bool:
+        for u in config_users:
+            if u.get("username") == username:
+                bindings = load_bindings()
+                bindings[qq_id] = username
+                save_bindings(bindings)
+                return True
+        return False
+
+    def unbind_user(self, qq_id: str):
+        bindings = load_bindings()
+        if qq_id in bindings:
+            del bindings[qq_id]
+            save_bindings(bindings)
+
+    async def get_account(self, qq_id: str, config_users: list) -> tuple:
+        username = self._find_username(qq_id)
+        if not username:
+            raise ValueError("未绑定账号，请先使用 /zx bind <用户名> 绑定")
+
+        cred = self._find_credential(username, config_users)
+        if not cred:
+            raise ValueError(f"账号 {username} 不在配置列表中，请联系管理员")
+
+        username, password = cred
+
+        cookies = load_cookies_for(username)
         if cookies:
             try:
                 account = login_cookie(cookies)
                 return account, "cookie"
             except Exception:
-                self.log(f"    用户 {qq_id} 旧Cookie失效，重新登录...")
+                self.log(f"    用户 {qq_id}({username}) 旧Cookie失效，重新登录...")
 
-        self.log(f"    用户 {qq_id} 启动Playwright登录...")
+        self.log(f"    用户 {qq_id}({username}) 启动Playwright登录...")
         async with self._playwright_lock:
             new_cookies = await playwright_login(username, password, print_fn=self.log)
-            save_cookies(qq_id, new_cookies)
+            save_cookies_for(username, new_cookies)
             account = login_cookie(new_cookies)
             return account, "playwright"
 
-    async def get_exams(self, qq_id: str) -> list:
-        account, method = await self.get_account(qq_id)
+    async def get_exams(self, qq_id: str, config_users: list) -> list:
+        account, _ = await self.get_account(qq_id, config_users)
         exams = account.get_exams()
         result = []
         for exam in exams:
@@ -287,8 +307,8 @@ class ZhiXueManager:
             })
         return result
 
-    async def get_marks(self, qq_id: str, exam_name: str = None) -> tuple:
-        account, method = await self.get_account(qq_id)
+    async def get_marks(self, qq_id: str, config_users: list, exam_name: str = None) -> tuple:
+        account, _ = await self.get_account(qq_id, config_users)
         user_name = account.name
         if exam_name:
             exam = None
@@ -321,10 +341,12 @@ class ZhiXueManager:
                 exam_info = exam_name and {"name": exam_name} or {}
         return user_name, exam_info, subjects
 
-    async def check_new_scores(self, qq_id: str) -> list:
-        account, method = await self.get_account(qq_id)
+    async def check_new_scores(self, qq_id: str, config_users: list) -> list:
+        account, _ = await self.get_account(qq_id, config_users)
+        username = self._find_username(qq_id)
         all_scores = load_scores()
-        user_scores = all_scores.get(qq_id, {})
+        user_key = username or qq_id
+        user_scores = all_scores.get(user_key, {})
 
         new_items = []
         try:
@@ -341,15 +363,12 @@ class ZhiXueManager:
                         })
                     new_items.append({"exam": exam_name, "subjects": subs})
                     user_scores[exam_name] = {"timestamp": time.time()}
-                    all_scores[qq_id] = user_scores
+                    all_scores[user_key] = user_scores
                     save_scores(all_scores)
         except Exception:
             pass
 
         return new_items
-
-    async def get_latest_marks(self, qq_id: str) -> tuple:
-        return await self.get_marks(qq_id, exam_name=None)
 
 
 zhixue_manager = ZhiXueManager()
@@ -366,8 +385,6 @@ def format_exams_table(exams: list) -> str:
     lines.append("")
     lines.append("发送 /zx marks <考试名> 查询对应成绩")
     return "\n".join(lines)
-
-
 
 
 def format_marks_table(user_name: str, exam_name: str, subjects: list) -> str:

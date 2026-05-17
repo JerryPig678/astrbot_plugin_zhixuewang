@@ -1,0 +1,42 @@
+{
+  "users": {
+    "description": "智学网账号列表",
+    "type": "template_list",
+    "hint": "在此添加智学网账号。用户使用 /zx bind <用户名> 绑定后即可查询成绩",
+    "templates": {
+      "account": {
+        "name": "智学网账号",
+        "hint": "一个智学网账号及密码",
+        "items": {
+          "username": {
+            "description": "智学网用户名",
+            "type": "string",
+            "hint": "通常是学号或手机号"
+          },
+          "password": {
+            "description": "智学网密码",
+            "type": "string",
+            "hint": "登录智学网的密码"
+          }
+        }
+      }
+    }
+  },
+  "watch_enabled": {
+    "description": "开启新成绩监听",
+    "type": "bool",
+    "default": false
+  },
+  "watch_interval": {
+    "description": "监听间隔（分钟）",
+    "type": "int",
+    "default": 5,
+    "hint": "每隔多少分钟检查一次新成绩，最小1分钟"
+  },
+  "watch_group_umo": {
+    "description": "新成绩通知目标群聊UMO",
+    "type": "string",
+    "default": "",
+    "hint": "在目标群发送任意消息，查看日志获取 unified_msg_origin。留空则通知到当前群"
+  }
+}
