@@ -1,3 +1,9 @@
 # AstrBot 智学网插件
 __pycache__/
 *.pyc
+
+# Runtime data (generated at runtime, not committed)
+data/bindings.json
+data/scores.json
+data/cookies/*.json
+!data/cookies/.gitkeep

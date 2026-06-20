@@ -1,7 +1,7 @@
 from uuid import uuid4
 from curl_cffi import requests
 import random, time, json
-from geeked.sign import Signer
+from .sign import Signer
 
 
 class Geeked:

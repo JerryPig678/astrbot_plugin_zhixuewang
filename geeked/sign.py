@@ -4,15 +4,15 @@ import urllib.parse
 import binascii
 import json
 import re
-import requests
+
+from curl_cffi import requests
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from Crypto.PublicKey.RSA import construct
 from Crypto.Cipher import PKCS1_v1_5
-from geeked.slide import SlideSolver
-from geeked.gobang import GobangSolver
-from geeked.icon import IconSolver
+from .slide import SlideSolver
+
 
 class LotParser:
     def __init__(self):
@@ -70,7 +70,7 @@ class LotParser:
         return a
 
 
-lotParser = LotParser()  # doesn't need to calculate the lot and lot_res every time, so were gonna cache it
+lotParser = LotParser()
 
 
 class Signer:
@@ -105,23 +105,6 @@ class Signer:
 
         return encrypted_hex
 
-    """ ill implement it when needed
-function encrypt_asymmetric_2(input, key) {
-	void 0 === key && (key = '9a4ea935b2576f37516d9b29cd8d8cc9bffe548ba6853253ba20f4ba44fba8c9e97a398882769aa0dd1e3e1b5601429287303880ca17bd244ed73bf702a68fc7');
-	var moreargs = 2 < arguments['length'] && arguments[2] !== undefined ? arguments[2] : 1;
-	var encryptor = new _ᖉᖉᕾᖉ;
-
-	input = sortaGlobals['hexToArray'](sortaGlobals['parseUtf8StringToHex'](input)), 128 < key['length'] && (key = key['substr'](key['length'] - 128));
-	var keyLeft = key['substr'](0, 64), keyRest = key['substr'](64);
-	key = encryptor['createPoint'](keyLeft, keyRest);
-	var initCypher = encryptor['initEncipher'](key);
-	encryptor['encryptBlock'](input);
-	var end = sortaGlobals['arrayToHex'](input);
-	emptyArray = new Array(32);
-	return encryptor['doFinal'](emptyArray), emptyArray = sortaGlobals['arrayToHex'](emptyArray), 0 === moreargs ? initCypher + end + emptyArray : initCypher + emptyArray + end
-}
-    """
-
     @staticmethod
     def encrypt_w(raw_input, pt) -> str:
         if not pt or '0' == pt:
@@ -134,14 +117,14 @@ function encrypt_asymmetric_2(input, key) {
         if pt == "1":
             enc_key = Signer.encrypt_asymmetric_1(random_uid)
             enc_input = Signer.encrypt_symmetrical_1(raw_input, random_uid)
-        else:  # elif pt == "2" # there's either "1" or "2"
+        else:
             raise NotImplementedError("This type of encryption is not implemented yet. Create an issue")
 
         return binascii.hexlify(enc_input).decode() + enc_key
 
     @staticmethod
     def generate_pow(lot_number_pow, captcha_id_pow, hash_func, hash_version, bits, date, empty) -> dict:
-        """Generate the pow_msg & pow_sign | translated directly from the .js"""
+        """Generate the pow_msg & pow_sign."""
         bit_remainder = bits % 4
         bit_division = bits // 4
 
@@ -186,57 +169,49 @@ function encrypt_asymmetric_2(input, key) {
             **Signer.generate_pow(lot_number, captcha_id, pow_detail['hashfunc'], pow_detail['version'],
                                   pow_detail['bits'], pow_detail['datetime'], ""),
             **lotParser.get_dict(lot_number),
-            "biht": "1426265548",  # static
-            "device_id": "",  # why is this empty!!
-            "em": {  # save to have this static (see em.js)
-                "cp": 0,  # checkCallPhantom
-                "ek": "11",  # checkErrorKeys "11" as value is also fine
-                "nt": 0,  # checkNightmare
-                "ph": 0,  # checkPhantom
-                "sc": 0,  # checkSeleniumMarker
-                "si": 0,  # checkScriptFn
-                "wd": 1,  # checkWebDriver
+            "biht": "1426265548",
+            "device_id": "",
+            "em": {
+                "cp": 0,
+                "ek": "11",
+                "nt": 0,
+                "ph": 0,
+                "sc": 0,
+                "si": 0,
+                "wd": 1,
             },
             "gee_guard": {
-                "roe": {  # "3" = no | "1" = yes
-                    "auh": "3",  # HEADCHR_UA            | regex(/HeadlessChrome/) in UserAgent
-                    "aup": "3",  # PHANTOM_UA            | regex(/PhantomJS/) in UserAgent
-                    "cdc": "3",  # CDC                   | cdc check
-                    "egp": "3",  # PHANTOM_LANGUAGE      | language header !== undefined
-                    "res": "3",  # SELENIUM_DRIVER       | 35 selenium checks 💀
-                    "rew": "3",  # WEBDRIVER             | webDriver check
-                    "sep": "3",  # PHANTOM_PROPERTIES    | phantomJS check
-                    "snh": "3",  # HEADCHR_PERMISSIONS   | checks browser version etc.
+                "roe": {
+                    "auh": "3",
+                    "aup": "3",
+                    "cdc": "3",
+                    "egp": "3",
+                    "res": "3",
+                    "rew": "3",
+                    "sep": "3",
+                    "snh": "3",
                 }
             },
-            "ep": "123",  # static
-            "geetest": "captcha",  # static
-            "lang": "zh",  # static
+            "ep": "123",
+            "geetest": "captcha",
+            "lang": "zh",
             "lot_number": lot_number,
         }
 
         if risk_type in ("ai", "invisible"):
             pass
         elif risk_type == "slide":
+            from curl_cffi.requests import get as curl_get
             left = SlideSolver(
-                requests.get(f"https://static.geetest.com/{data['slice']}", timeout=10).content,
-                requests.get(f"https://static.geetest.com/{data['bg']}", timeout=10).content
+                curl_get(f"https://static.geetest.com/{data['slice']}", timeout=10).content,
+                curl_get(f"https://static.geetest.com/{data['bg']}", timeout=10).content
             ).find_puzzle_piece_position() + random.uniform(0, .5)
             base |= {
-                "passtime": random.randint(600, 1200),  # time in ms it took to solve
+                "passtime": random.randint(600, 1200),
                 "setLeft": left,
-                "userresponse": left / 1.0059466666666665 + 2  # 1.0059466666666665 = .8876 * 340 / 300
-            }
-        elif risk_type in ("winlinze", "gobang"):
-            base |= {
-                "userresponse": GobangSolver(data["ques"]).find_four_in_line()
-            }
-        elif risk_type in 'icon':
-            base |= {
-                "passtime": random.randint(600, 1200),  # time in ms it took to solve
-                "userresponse": IconSolver(data["imgs"], data["ques"]).find_icon_position()
+                "userresponse": left / 1.0059466666666665 + 2
             }
         else:
-            raise NotImplementedError(f"This type ({risk_type}) of captcha is not implemented yet.")
+            raise NotImplementedError(f"This type ({risk_type}) of captcha is not implemented. Only slide is supported.")
 
         return Signer.encrypt_w(json.dumps(base), data["pt"])

@@ -1,12 +1,9 @@
 import asyncio
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star
 from astrbot.api import logger, AstrBotConfig
+from astrbot.api.event import MessageChain
 
 from zhixue_core import (
     zhixue_manager,
@@ -36,7 +33,7 @@ class ZhiXuePlugin(Star):
     def _start_watch(self):
         if self._watch_task and not self._watch_task.done():
             self._watch_task.cancel()
-        self._watch_task = asyncio.ensure_future(self._watch_loop())
+        self._watch_task = asyncio.create_task(self._watch_loop())
         logger.info("成绩监听已启动")
 
     async def _stop_watch(self):
@@ -70,17 +67,13 @@ class ZhiXuePlugin(Star):
                                 msg_text = format_marks_table(
                                     username, item["exam"], item["subjects"]
                                 )
-                                msg_text = f"📢 新成绩通知！\n{msg_text}"
+                                msg_text = f"​📢 新成绩通知！\n{msg_text}"
                                 if group_umo:
-                                    from astrbot.api.message_components import Plain
-                                    from astrbot.api.event import MessageChain
                                     chain = MessageChain().message(msg_text)
                                     try:
                                         await self.context.send_message(group_umo, chain)
-                                    except Exception:
-                                        await self.context.send_message(
-                                            group_umo, [Plain(msg_text)]
-                                        )
+                                    except Exception as e:
+                                        logger.warning(f"发送通知到 {group_umo} 失败: {e}")
                     except Exception as e:
                         logger.warning(f"监听用户 {qq_id}({username}) 失败: {e}")
 
@@ -90,11 +83,9 @@ class ZhiXuePlugin(Star):
                 logger.error(f"监听循环异常: {e}")
                 await asyncio.sleep(10)
 
-    def _get_user_password(self, username: str) -> str | None:
-        for u in self.config.get("users", []):
-            if u.get("username") == username:
-                return u.get("password")
-        return None
+    # -----------------------------------------------------------------------
+    # command group: /zx
+    # -----------------------------------------------------------------------
 
     @filter.command_group("zx")
     def zx(self):
@@ -102,6 +93,7 @@ class ZhiXuePlugin(Star):
 
     @zx.command("help")
     async def zx_help(self, event: AstrMessageEvent):
+        '''查看帮助信息'''
         help_text = (
             "智学网成绩查询\n"
             "  /zx bind <用户名>  - 绑定智学网账号\n"
@@ -115,6 +107,7 @@ class ZhiXuePlugin(Star):
 
     @zx.command("bind")
     async def zx_bind(self, event: AstrMessageEvent, username: str):
+        '''绑定智学网账号'''
         config_users = self.config.get("users", [])
         ok = zhixue_manager.bind_user(event.get_sender_id(), username, config_users)
         if ok:
@@ -129,11 +122,13 @@ class ZhiXuePlugin(Star):
 
     @zx.command("unbind")
     async def zx_unbind(self, event: AstrMessageEvent):
+        '''解绑当前账号'''
         zhixue_manager.unbind_user(event.get_sender_id())
         yield event.plain_result("已解绑智学网账号")
 
     @zx.command("exams")
     async def zx_exams(self, event: AstrMessageEvent):
+        '''查看考试列表'''
         yield event.plain_result("⏳ 正在查询考试列表...")
         try:
             config_users = self.config.get("users", [])
@@ -146,6 +141,7 @@ class ZhiXuePlugin(Star):
 
     @zx.command("marks")
     async def zx_marks(self, event: AstrMessageEvent, exam_name: str = None):
+        '''查询成绩，可指定考试名'''
         yield event.plain_result("⏳ 正在查询成绩...")
         try:
             config_users = self.config.get("users", [])
@@ -161,6 +157,7 @@ class ZhiXuePlugin(Star):
 
     @zx.command("watch")
     async def zx_watch(self, event: AstrMessageEvent, action: str = "on", interval: int = 5):
+        '''开启/停止成绩监听'''
         if action == "off":
             self.config["watch_enabled"] = False
             self.config.save_config()
@@ -191,6 +188,7 @@ class ZhiXuePlugin(Star):
 
     @zx.command("status")
     async def zx_status(self, event: AstrMessageEvent):
+        '''查看当前状态'''
         is_running = self._watch_task and not self._watch_task.done()
         bindings = load_bindings()
         config_users = self.config.get("users", [])
@@ -208,8 +206,17 @@ class ZhiXuePlugin(Star):
             lines.append(f"    - {username} {valid}")
         yield event.plain_result("\n".join(lines))
 
+    # -----------------------------------------------------------------------
+    # LLM tools (function calling)
+    # -----------------------------------------------------------------------
+
     @filter.llm_tool(name="zhixue_get_exams")
     async def llm_get_exams(self, event: AstrMessageEvent) -> MessageEventResult:
+        '''查询智学网考试列表，返回当前用户的所有考试信息。
+
+        Args:
+            无参数
+        '''
         user_id = event.get_sender_id()
         try:
             config_users = self.config.get("users", [])
@@ -222,6 +229,11 @@ class ZhiXuePlugin(Star):
 
     @filter.llm_tool(name="zhixue_get_marks")
     async def llm_get_marks(self, event: AstrMessageEvent, exam_name: str) -> MessageEventResult:
+        '''查询智学网指定考试的成绩，返回各科目分数和排名。
+
+        Args:
+            exam_name(string): 考试名称关键词，支持模糊匹配
+        '''
         user_id = event.get_sender_id()
         try:
             config_users = self.config.get("users", [])
@@ -236,6 +248,11 @@ class ZhiXuePlugin(Star):
 
     @filter.llm_tool(name="zhixue_get_latest_marks")
     async def llm_get_latest(self, event: AstrMessageEvent) -> MessageEventResult:
+        '''查询智学网最近一次考试的成绩。
+
+        Args:
+            无参数
+        '''
         user_id = event.get_sender_id()
         try:
             config_users = self.config.get("users", [])

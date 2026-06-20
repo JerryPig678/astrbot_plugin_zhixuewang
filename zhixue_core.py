@@ -1,12 +1,9 @@
 import asyncio
 import json
 import os
-import re
-import random
-import time
 import hashlib
+import time
 
-import httpx
 from zhixuewang import login_cookie
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,9 +11,6 @@ DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 BINDINGS_FILE = os.path.join(DATA_DIR, "bindings.json")
 SCORES_FILE = os.path.join(DATA_DIR, "scores.json")
 COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
-
-CAPTCHA_ID = "a6474422e78e5bb048082ec77d141068"
-MAX_RETRIES = 8
 
 
 def _safe_name(username: str) -> str:
@@ -66,165 +60,28 @@ def save_scores(scores: dict):
         json.dump(scores, f, ensure_ascii=False, indent=2)
 
 
-def _detect_type(data: dict) -> str:
-    if "bg" in data:
-        return "slide"
-    if "imgs" in data:
-        return "icon"
-    if isinstance(data.get("ques"), list) and data["ques"] and isinstance(data["ques"][0], list):
-        return "gobang"
-    return "ai"
+def _http_login(username: str, password: str, print_fn=None) -> dict:
+    """Pure-HTTP login via plugin_login (no Playwright)."""
+    from .plugin_login import http_login
 
-
-async def playwright_login(username: str, password: str, print_fn=None) -> dict:
-    from playwright.async_api import async_playwright
-    from geeked.sign import Signer
-    from geeked.slide import SlideSolver
-    from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
-
-    def log(msg):
+    def _log(msg: str) -> None:
         if print_fn:
             print_fn(msg)
 
-    load_data = None
-    captcha_type = None
-    browser_captcha_id = None
-
-    async def handle_load(route):
-        nonlocal load_data, captcha_type, browser_captcha_id
-        url = route.request.url
-        if "captcha_id" not in url:
-            await route.continue_()
-            return
-        m = re.search(r"captcha_id=([a-f0-9]+)", url)
-        if m:
-            browser_captcha_id = m.group(1)
-        response = await route.fetch()
-        body = await response.text()
-        json_match = re.search(r"\((\{.*\})\)\s*$", body, re.DOTALL)
-        if json_match:
-            jsonp_data = json.loads(json_match.group(1))
-            load_data = jsonp_data.get("data", jsonp_data)
-            captcha_type = _detect_type(load_data)
-        await route.fulfill(response=response)
-
-    async def handle_verify(route):
-        nonlocal load_data, captcha_type, browser_captcha_id
-        try:
-            url = route.request.url
-            parsed = urlparse(url)
-            params = dict(parse_qs(parsed.query))
-            params = {k: v[0] for k, v in params.items()}
-            w = Signer.generate_w(load_data, browser_captcha_id, captcha_type)
-            params["w"] = w
-            new_query = urlencode(params)
-            new_url = urlunparse(parsed._replace(query=new_query))
-            response = await route.fetch(url=new_url)
-            await route.fulfill(response=response)
-        except Exception as e:
-            log(f"    [verify] 失败: {e}")
-            await route.continue_()
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled",
-                  "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-        )
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        """)
-        page = await context.new_page()
-        await page.route("**/xunfei.geetest.com/load*", handle_load)
-        await page.route("**/xunfei.geetest.com/verify*", handle_verify)
-
-        login_success = False
-        for attempt in range(1, MAX_RETRIES + 1):
-            load_data = None
-            captcha_type = None
-            browser_captcha_id = None
-            log(f"    第{attempt}/{MAX_RETRIES}次尝试...")
-            await page.goto("https://www.zhixue.com/wap_login.html", wait_until="networkidle")
-            await page.fill("#txtUserName", username)
-            await page.fill("#txtPassword", password)
-            await asyncio.sleep(0.5)
-            await page.click("#signup_button")
-            await asyncio.sleep(3)
-
-            if captcha_type and captcha_type != "slide":
-                log(f"    非slide({captcha_type})，重试...")
-                continue
-
-            if captcha_type == "slide":
-                bg_url = f"https://static.geetest.com/{load_data['bg']}"
-                slice_url = f"https://static.geetest.com/{load_data['slice']}"
-                bg_img = httpx.get(bg_url, timeout=15).content
-                slice_img = httpx.get(slice_url, timeout=15).content
-                distance = SlideSolver(slice_img, bg_img).find_puzzle_piece_position()
-                log(f"    slide distance={distance:.1f}")
-
-                slider = None
-                box = None
-                for sel in [".geetest_btn", ".geetest_slider_button",
-                            "[class*='slider_button']", "[class*='geetest_slider']"]:
-                    try:
-                        loc = page.locator(sel).first
-                        if await loc.count() > 0:
-                            b = await loc.bounding_box()
-                            if b and b["width"] > 10 and b["height"] > 10:
-                                slider = loc
-                                box = b
-                                break
-                    except Exception:
-                        continue
-
-                if slider and box:
-                    sx = box["x"] + box["width"] / 2
-                    sy = box["y"] + box["height"] / 2
-                    await page.mouse.move(sx, sy)
-                    await page.mouse.down()
-                    steps = random.randint(30, 50)
-                    for i in range(1, steps + 1):
-                        p = i / steps
-                        await page.mouse.move(
-                            sx + distance * (p * (2 - p)),
-                            sy + random.uniform(-2, 2)
-                        )
-                        await asyncio.sleep(random.uniform(0.005, 0.015))
-                    await page.mouse.move(sx + distance + random.uniform(0, 3),
-                                          sy + random.uniform(-1, 1))
-                    await page.mouse.up()
-                    await asyncio.sleep(3)
-
-            try:
-                await page.wait_for_url("https://www.zhixue.com/htm-vessel/**", timeout=90000)
-                login_success = True
-                break
-            except Exception:
-                continue
-
-        cookies = await page.context.cookies()
-        cookies_dict = {c.get("name"): c.get("value") for c in cookies}
-        cookies_dict["loginUserName"] = username
-        await browser.close()
-
-        if not login_success:
-            raise RuntimeError("Playwright登录失败")
-
-        return cookies_dict
+    _log(f"    [HTTP] 开始纯HTTP登录 {username}...")
+    try:
+        cookies = http_login(username, password, print_fn=print_fn)
+        _log(f"    [HTTP] 登录成功, 获取 {len(cookies)} 个 cookie")
+        return cookies
+    except Exception as e:
+        _log(f"    [HTTP] 登录失败: {e}")
+        raise RuntimeError(f"纯HTTP登录失败: {e}") from e
 
 
 class ZhiXueManager:
     def __init__(self, log_fn=None):
         self.log = log_fn or print
-        self._playwright_lock = asyncio.Lock()
-
-    def _get_user_config(self, username: str) -> dict | None:
-        raise NotImplementedError
+        self._login_lock = asyncio.Lock()
 
     def _find_username(self, qq_id: str) -> str | None:
         bindings = load_bindings()
@@ -235,23 +92,6 @@ class ZhiXueManager:
             if u.get("username") == username:
                 return username, u.get("password", "")
         return None
-
-    def bound_users_count(self, config_users: list) -> int:
-        bindings = load_bindings()
-        count = 0
-        usernames = {u.get("username") for u in config_users}
-        for qq_id, username in bindings.items():
-            if username in usernames:
-                count += 1
-        return count
-
-    def get_bindings_info(self, config_users: list) -> list:
-        bindings = load_bindings()
-        usernames = {u.get("username"): u for u in config_users}
-        result = []
-        for qq_id, username in bindings.items():
-            result.append((qq_id, username, username in usernames))
-        return result
 
     def bind_user(self, qq_id: str, username: str, config_users: list) -> bool:
         for u in config_users:
@@ -287,12 +127,14 @@ class ZhiXueManager:
             except Exception:
                 self.log(f"    用户 {qq_id}({username}) 旧Cookie失效，重新登录...")
 
-        self.log(f"    用户 {qq_id}({username}) 启动Playwright登录...")
-        async with self._playwright_lock:
-            new_cookies = await playwright_login(username, password, print_fn=self.log)
+        self.log(f"    用户 {qq_id}({username}) 启动纯HTTP登录...")
+        async with self._login_lock:
+            new_cookies = await asyncio.to_thread(
+                _http_login, username, password, print_fn=self.log
+            )
             save_cookies_for(username, new_cookies)
             account = login_cookie(new_cookies)
-            return account, "playwright"
+            return account, "http"
 
     async def get_exams(self, qq_id: str, config_users: list) -> list:
         account, _ = await self.get_account(qq_id, config_users)
