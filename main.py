@@ -5,7 +5,7 @@ from astrbot.api.star import Context, Star
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import MessageChain
 
-from zhixue_core import (
+from .zhixue_core import (
     zhixue_manager,
     load_bindings,
     format_exams_table,
