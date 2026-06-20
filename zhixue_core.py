@@ -4,7 +4,7 @@ import os
 import hashlib
 import time
 
-from zhixuewang import login_cookie
+from .zhixue_api import login_cookie
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
