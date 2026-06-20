@@ -1,14 +1,18 @@
 import asyncio
 import json
+import logging
 import os
 import hashlib
 import time
 
 from .zhixue_api import login_cookie
 
+logger = logging.getLogger(__name__)
+
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
-BINDINGS_FILE = os.path.join(DATA_DIR, "bindings.json")
+ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
+BINDINGS_FILE = os.path.join(DATA_DIR, "bindings.json")  # legacy, for migration
 SCORES_FILE = os.path.join(DATA_DIR, "scores.json")
 COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
 
@@ -36,16 +40,115 @@ def save_cookies_for(username: str, cookies: dict):
 
 
 def load_bindings() -> dict:
+    """Legacy: load old bindings.json for migration."""
     if os.path.exists(BINDINGS_FILE):
         with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-def save_bindings(bindings: dict):
+def load_accounts(config_users: list = None) -> dict:
+    """Load accounts.json. Migrates from bindings.json if needed.
+
+    Filters out usernames not in config_users (if provided).
+    """
+    if not os.path.exists(ACCOUNTS_FILE):
+        # Try migration from legacy bindings.json
+        if os.path.exists(BINDINGS_FILE):
+            return _migrate_bindings(config_users)
+        return {}
+
+    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+        accounts = json.load(f)
+
+    # Filter invalid usernames
+    if config_users:
+        valid_usernames = {u.get("username") for u in config_users}
+        removed = [un for un in accounts if un not in valid_usernames]
+        for un in removed:
+            logger.warning(f"[accounts] 账号 {un} 不在配置中，已清理绑定")
+            del accounts[un]
+        if removed:
+            save_accounts(accounts)
+
+    return accounts
+
+
+def _migrate_bindings(config_users: list = None) -> dict:
+    """Migrate legacy bindings.json to accounts.json."""
+    old = load_bindings()
+    if not old:
+        return {}
+
+    accounts = {}
+    for user_id, username in old.items():
+        if isinstance(username, dict):
+            username = username.get("username", "")
+        if not username:
+            continue
+        if config_users and username not in {u.get("username") for u in config_users}:
+            logger.warning(f"[accounts] 迁移时跳过无效账号: {username}")
+            continue
+        if username not in accounts:
+            accounts[username] = {"bound_ids": []}
+        accounts[username]["bound_ids"].append({
+            "user_id": user_id,
+            "platform_id": "aiocqhttp",  # default for legacy data
+        })
+
+    save_accounts(accounts)
+    logger.info(f"[accounts] 从 bindings.json 迁移了 {len(accounts)} 个账号")
+    return accounts
+
+
+def save_accounts(accounts: dict):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(BINDINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(bindings, f, ensure_ascii=False, indent=2)
+    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=2)
+
+
+def find_username_by_id(accounts: dict, user_id: str) -> str | None:
+    """Find which username a user_id is bound to."""
+    for username, data in accounts.items():
+        for binding in data.get("bound_ids", []):
+            if binding.get("user_id") == user_id:
+                return username
+    return None
+
+
+def get_bound_ids(accounts: dict, username: str) -> list:
+    """Get all bound IDs for a username."""
+    return accounts.get(username, {}).get("bound_ids", [])
+
+
+def bind_user_to_account(accounts: dict, user_id: str, username: str, platform_id: str) -> bool:
+    """Bind a user_id to a username. Removes user_id from any other account first."""
+    # Remove from existing bindings
+    for un, data in accounts.items():
+        data["bound_ids"] = [
+            b for b in data.get("bound_ids", [])
+            if b.get("user_id") != user_id
+        ]
+
+    # Add to target account
+    if username not in accounts:
+        accounts[username] = {"bound_ids": []}
+    accounts[username]["bound_ids"].append({
+        "user_id": user_id,
+        "platform_id": platform_id,
+    })
+    save_accounts(accounts)
+    return True
+
+
+def unbind_user_from_account(accounts: dict, user_id: str):
+    """Remove a user_id from all accounts."""
+    for un, data in accounts.items():
+        data["bound_ids"] = [
+            b for b in data.get("bound_ids", [])
+            if b.get("user_id") != user_id
+        ]
+    save_accounts(accounts)
 
 
 def load_scores() -> dict:
@@ -79,13 +182,16 @@ def _http_login(username: str, password: str, print_fn=None) -> dict:
 
 
 class ZhiXueManager:
+    _EXAMS_CACHE_TTL = 300  # 5 minutes
+
     def __init__(self, log_fn=None):
         self.log = log_fn or print
         self._login_lock = asyncio.Lock()
+        self._exams_cache: dict = {}  # username -> (exams_list, timestamp)
 
-    def _find_username(self, qq_id: str) -> str | None:
-        bindings = load_bindings()
-        return bindings.get(qq_id)
+    def _find_username(self, user_id: str, config_users: list = None) -> str | None:
+        accounts = load_accounts(config_users)
+        return find_username_by_id(accounts, user_id)
 
     def _find_credential(self, username: str, config_users: list) -> tuple | None:
         for u in config_users:
@@ -93,23 +199,20 @@ class ZhiXueManager:
                 return username, u.get("password", "")
         return None
 
-    def bind_user(self, qq_id: str, username: str, config_users: list) -> bool:
+    def bind_user(self, user_id: str, username: str, config_users: list, platform_id: str = "unknown") -> bool:
         for u in config_users:
             if u.get("username") == username:
-                bindings = load_bindings()
-                bindings[qq_id] = username
-                save_bindings(bindings)
+                accounts = load_accounts(config_users)
+                bind_user_to_account(accounts, user_id, username, platform_id)
                 return True
         return False
 
-    def unbind_user(self, qq_id: str):
-        bindings = load_bindings()
-        if qq_id in bindings:
-            del bindings[qq_id]
-            save_bindings(bindings)
+    def unbind_user(self, user_id: str, config_users: list = None):
+        accounts = load_accounts(config_users)
+        unbind_user_from_account(accounts, user_id)
 
-    async def get_account(self, qq_id: str, config_users: list) -> tuple:
-        username = self._find_username(qq_id)
+    async def get_account(self, user_id: str, config_users: list) -> tuple:
+        username = self._find_username(user_id, config_users)
         if not username:
             raise ValueError("未绑定账号，请先使用 /zx bind <用户名> 绑定")
 
@@ -125,9 +228,9 @@ class ZhiXueManager:
                 account = login_cookie(cookies)
                 return account, "cookie"
             except Exception:
-                self.log(f"    用户 {qq_id}({username}) 旧Cookie失效，重新登录...")
+                self.log(f"    用户 {user_id}({username}) 旧Cookie失效，重新登录...")
 
-        self.log(f"    用户 {qq_id}({username}) 启动纯HTTP登录...")
+        self.log(f"    用户 {user_id}({username}) 启动纯HTTP登录...")
         async with self._login_lock:
             new_cookies = await asyncio.to_thread(
                 _http_login, username, password, print_fn=self.log
@@ -136,37 +239,67 @@ class ZhiXueManager:
             account = login_cookie(new_cookies)
             return account, "http"
 
-    async def get_exams(self, qq_id: str, config_users: list) -> list:
-        account, _ = await self.get_account(qq_id, config_users)
-        exams = account.get_exams()
-        result = []
-        for exam in exams:
-            result.append({
+    def _get_cached_exams(self, account) -> list:
+        """Get exams list with 5-minute cache per account name."""
+        name = account.name or "default"
+        now = time.time()
+        if name in self._exams_cache:
+            exams, ts = self._exams_cache[name]
+            if now - ts < self._EXAMS_CACHE_TTL:
+                return exams
+        exams_raw = account.get_exams()
+        exams = []
+        for exam in exams_raw:
+            exams.append({
                 "id": getattr(exam, "id", ""),
                 "name": getattr(exam, "name", str(exam)),
                 "is_final": getattr(exam, "is_final", False),
                 "grade_code": getattr(exam, "grade_code", ""),
+                "_exam_obj": exam,
             })
-        return result
+        self._exams_cache[name] = (exams, now)
+        return exams
 
-    async def get_marks(self, qq_id: str, config_users: list, exam_name: str = None) -> tuple:
-        account, _ = await self.get_account(qq_id, config_users)
+    async def get_exams(self, user_id: str, config_users: list) -> list:
+        account, _ = await self.get_account(user_id, config_users)
+        return self._get_cached_exams(account)
+
+    async def get_marks(self, user_id: str, config_users: list, exam_param: str = None) -> tuple:
+        account, _ = await self.get_account(user_id, config_users)
         user_name = account.name
-        if exam_name:
-            exam = None
-            for e in account.get_exams():
-                en = getattr(e, "name", str(e))
-                if exam_name in en:
-                    exam = e
-                    break
-            if exam is None:
-                raise ValueError(f"未找到考试: {exam_name}")
+        exam = None
+        if exam_param is not None:
+            exam_str = str(exam_param)
+            if exam_str.isdigit():
+                idx = int(exam_str) - 1
+                exams = self._get_cached_exams(account)
+                if idx < 0 or idx >= len(exams):
+                    raise ValueError(f"序号 {exam_param} 超出范围，共 {len(exams)} 场考试")
+                exam = exams[idx].get("_exam_obj") or exams[idx]
+            else:
+                for e in account.get_exams():
+                    en = getattr(e, "name", str(e))
+                    if exam_str in en:
+                        exam = e
+                        break
+                if exam is None:
+                    raise ValueError(f"未找到考试: {exam_param}")
             marks = account.get_self_mark(exam)
         else:
             marks = account.get_self_mark()
+
         subjects = []
+        total_info = None
         if marks:
             for m in marks:
+                code = getattr(m.subject, "code", "") if hasattr(m, "subject") else ""
+                if code == "99":
+                    total_info = {
+                        "name": getattr(m.subject, "name", "总分"),
+                        "score": getattr(m, "score", None),
+                        "standard_score": getattr(m.subject, "standard_score", None),
+                    }
+                    continue
                 subjects.append({
                     "subject": getattr(m.subject, "name", getattr(m, "subject_name", "未知")),
                     "score": getattr(m, "score", None),
@@ -174,20 +307,25 @@ class ZhiXueManager:
                     "class_rank": getattr(m, "class_rank", None),
                     "grade_rank": getattr(m, "grade_rank", None),
                 })
+
+        if total_info is None and subjects:
+            total = sum(s["score"] for s in subjects if s.get("score") is not None)
+            total_info = {"name": "总分", "score": total, "standard_score": None}
+
         exam_info = {}
         if marks and len(marks) > 0:
             e = getattr(marks[0], "exam", None)
             if e:
                 exam_info = {"name": getattr(e, "name", "未知"), "id": getattr(e, "id", "")}
             else:
-                exam_info = exam_name and {"name": exam_name} or {}
-        return user_name, exam_info, subjects
+                exam_info = exam_param and {"name": exam_param} or {}
+        return user_name, exam_info, subjects, total_info
 
-    async def check_new_scores(self, qq_id: str, config_users: list) -> list:
-        account, _ = await self.get_account(qq_id, config_users)
-        username = self._find_username(qq_id)
+    async def check_new_scores(self, user_id: str, config_users: list) -> list:
+        account, _ = await self.get_account(user_id, config_users)
+        username = self._find_username(user_id, config_users)
         all_scores = load_scores()
-        user_key = username or qq_id
+        user_key = username or user_id
         user_scores = all_scores.get(user_key, {})
 
         new_items = []
@@ -199,6 +337,9 @@ class ZhiXueManager:
                 if exam_name not in user_scores:
                     subs = []
                     for m in marks:
+                        code = getattr(m.subject, "code", "") if hasattr(m, "subject") else ""
+                        if code == "99":
+                            continue
                         subs.append({
                             "subject": getattr(m.subject, "name", "?"),
                             "score": getattr(m, "score", None),
@@ -225,16 +366,14 @@ def format_exams_table(exams: list) -> str:
         is_final = " [期末]" if e.get("is_final") else ""
         lines.append(f"  {i}. {name}{is_final}")
     lines.append("")
-    lines.append("发送 /zx marks <考试名> 查询对应成绩")
+    lines.append("发送 /zx marks <序号或考试名> 查询对应成绩")
     return "\n".join(lines)
 
 
-def format_marks_table(user_name: str, exam_name: str, subjects: list) -> str:
+def format_marks_table(user_name: str, exam_name: str, subjects: list, total_info: dict = None) -> str:
     if not subjects:
         return f"{user_name} 暂无 {exam_name} 成绩数据"
     lines = [f"【{user_name}】 {exam_name}"]
-    total = 0
-    count = 0
     for s in subjects:
         subj = s.get("subject", "?")
         score = s.get("score")
@@ -244,9 +383,6 @@ def format_marks_table(user_name: str, exam_name: str, subjects: list) -> str:
             extra.append(f"班排{s['class_rank']}")
         extra_str = f" ({', '.join(extra)})" if extra else ""
         lines.append(f"  {subj}: {score_str}{extra_str}")
-        if score is not None:
-            total += score
-            count += 1
-    if count > 0:
-        lines.append(f"  总分: {total:.1f}")
+    if total_info and total_info.get("score") is not None:
+        lines.append(f"  {total_info.get('name', '总分')}: {total_info['score']:.1f}")
     return "\n".join(lines)
