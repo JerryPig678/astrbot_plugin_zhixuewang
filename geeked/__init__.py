@@ -1,1 +1,1 @@
-from geeked.core import *
+from .core import *
