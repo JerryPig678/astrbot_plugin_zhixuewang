@@ -3,6 +3,6 @@ display_name: 智学网成绩查询
 desc: 智学网成绩查询插件 - 支持多用户绑定、考试列表查询、成绩表格展示、新成绩QQ监听通知。纯HTTP登录，无Playwright依赖。
 short_desc: 智学网成绩查询，多用户支持，自动监听新成绩
 author: zhixuemore
-version: 2.0.0
+version: 2.1.0
 support_platforms:
   - aiocqhttp
