@@ -1,0 +1,4 @@
+curl_cffi>=0.10.0
+opencv-python>=4.10.0
+numpy>=2.0.0
+pycryptodome>=3.21.0

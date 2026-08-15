@@ -1,0 +1,66 @@
+{
+  "users": {
+    "description": "智学网账号列表",
+    "type": "template_list",
+    "hint": "在此添加智学网账号。用户使用 /zx bind <用户名> 绑定后即可查询成绩",
+    "templates": {
+      "account": {
+        "name": "智学网账号",
+        "hint": "一个智学网账号及密码",
+        "items": {
+          "username": {
+            "description": "智学网用户名",
+            "type": "string",
+            "hint": "通常是学号或手机号"
+          },
+          "password": {
+            "description": "智学网密码",
+            "type": "string",
+            "hint": "登录智学网的密码"
+          }
+        }
+      }
+    }
+  },
+  "watch_enabled": {
+    "description": "开启新成绩监听",
+    "type": "bool",
+    "default": false
+  },
+  "watch_interval": {
+    "description": "监听间隔（分钟）",
+    "type": "int",
+    "default": 5,
+    "hint": "每隔多少分钟检查一次新成绩，最小1分钟"
+  },
+  "watch_groups": {
+    "description": "成绩通知推送群组",
+    "type": "template_list",
+    "hint": "按账号配置推送群组。每个条目绑定一个智学网账号，新成绩推送到该账号所有绑定用户私聊 + 对应群组",
+    "templates": {
+      "watch_group": {
+        "name": "监听群组",
+        "hint": "绑定一个智学网账号到推送群组",
+        "display_item": "group_name",
+        "items": {
+          "username": {
+            "description": "智学网用户名",
+            "type": "string",
+            "hint": "对应上方「智学网账号列表」中的用户名"
+          },
+          "group_name": {
+            "description": "群组名称（备注用）",
+            "type": "string",
+            "default": ""
+          },
+          "umo": {
+            "description": "群组 UMO 标识",
+            "type": "string",
+            "hint": "格式如 aiocqhttp:GroupMessage:123456",
+            "default": ""
+          }
+        }
+      }
+    }
+  }
+}

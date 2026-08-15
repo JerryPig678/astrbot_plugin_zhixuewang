@@ -1,0 +1,6 @@
+# AstrBot 智学网插件
+__pycache__/
+*.pyc
+
+# Runtime data (generated at runtime, not committed)
+data/
