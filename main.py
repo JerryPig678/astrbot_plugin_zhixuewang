@@ -4,7 +4,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import At
+from astrbot.api.message_components import At, Image
 from astrbot.core.agent.message import TextPart
 
 from .zhixue_core import (
@@ -148,10 +148,22 @@ class ZhiXuePlugin(Star):
                         new_items = await zhixue_manager.check_new_scores(first_id, config_users)
                         if new_items:
                             for item in new_items:
-                                msg_text = format_marks_table(
-                                    username, item["exam"], item["subjects"]
-                                )
-                                msg_text = f"[NEW SCORE]\n{msg_text}"
+                                change_type = item.get("change_type", "new_exam")
+                                if change_type == "new_exam":
+                                    header = f"[新考试] {item['exam']}"
+                                    msg_text = format_marks_table(
+                                        username, item["exam"], item["subjects"]
+                                    )
+                                else:
+                                    header = f"[成绩更新] {item['exam']}"
+                                    lines = [f"【{username}】 {item['exam']}"]
+                                    for s in item["subjects"]:
+                                        subj = s.get("subject", "?")
+                                        score = s.get("score")
+                                        score_str = f"{score:.1f}" if score is not None else "-"
+                                        lines.append(f"  {subj}: {score_str}")
+                                    msg_text = "\n".join(lines)
+                                msg_text = f"{header}\n{msg_text}"
                                 # Push to bound IDs (private chat)
                                 for binding in bound_ids:
                                     uid = binding.get("user_id", "")
@@ -198,6 +210,7 @@ class ZhiXuePlugin(Star):
             "  /zx bind <用户名>    - 绑定智学网账号\n"
             "  /zx exams            - 查看考试列表\n"
             "  /zx marks [序号/名称] - 查看成绩\n"
+            "  /zx sheet <学科> [考试] - 查看答题卡(带批改标注长图)\n"
             "  /zx watch on [间隔]|off - 开启/停止成绩监听\n"
             "  /zx status           - 查看状态\n"
             "  /zx unbind           - 解绑账号\n"
@@ -289,6 +302,30 @@ class ZhiXuePlugin(Star):
             yield event.plain_result(str(e))
         except Exception as e:
             yield event.plain_result(f"查询失败: {e}")
+
+    @zx.command("sheet")
+    async def zx_sheet(self, event: AstrMessageEvent, subject_name: str, exam_param: str = None):
+        '''查看答题卡(批改标注长图)'''
+        yield event.plain_result(f"正在查询「{subject_name}」答题卡并渲染批改标注...")
+        try:
+            config_users = self.config.get("users", [])
+            sheet_name, temp_paths = await zhixue_manager.get_sheet(
+                event.get_sender_id(), config_users, subject_name, exam_param
+            )
+            try:
+                for path in temp_paths:
+                    yield event.image_result(path)
+            finally:
+                import os
+                for path in temp_paths:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        except ValueError as e:
+            yield event.plain_result(str(e))
+        except Exception as e:
+            yield event.plain_result(f"查询答题卡失败: {e}")
 
     @zx.command("watch")
     async def zx_watch(self, event: AstrMessageEvent, action: str = "on", interval: int = 5):
@@ -436,3 +473,41 @@ class ZhiXuePlugin(Star):
             return str(e)
         except Exception as e:
             return f"查询失败: {e}"
+
+    @filter.llm_tool(name="zhixue_query_sheet")
+    async def llm_query_sheet(self, event: AstrMessageEvent, user_id: str, subject_name: str, exam_name: str = "") -> MessageEventResult:
+        '''查询学生某次考试某学科的答题卡图片。必须指定学科名称，考试名可选。
+
+        Args:
+            user_id(string): 要查询的用户ID。从上下文 user_context 获取：查自己用发送者ID，查别人用被@用户的ID
+            subject_name(string): 学科名称，如"数学"、"语文"等，支持模糊匹配
+            exam_name(string): 考试名称关键词，可选，不传则查询最新考试
+        '''
+        try:
+            config_users = self.config.get("users", [])
+            accounts = load_accounts(config_users)
+            zx_username = find_username_by_id(accounts, user_id)
+            if not zx_username:
+                yield event.plain_result(f"用户 {user_id} 未绑定智学网账号，请先使用 /zx bind 绑定")
+                return
+            exam_param = exam_name if exam_name else None
+            sheet_name, temp_paths = await zhixue_manager.get_sheet(
+                user_id, config_users, subject_name, exam_param
+            )
+            import os
+            try:
+                for path in temp_paths:
+                    yield event.image_result(path)
+                yield event.plain_result(
+                    f"已发送「{sheet_name}」答题卡图片，共 {len(temp_paths)} 页。"
+                )
+            finally:
+                for path in temp_paths:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        except ValueError as e:
+            yield event.plain_result(str(e))
+        except Exception as e:
+            yield event.plain_result(f"查询答题卡失败: {e}")

@@ -1,8 +1,8 @@
 name: astrbot_plugin_zhixuewang
 display_name: 智学网成绩查询
-desc: 智学网成绩查询插件 - 支持多用户绑定、考试列表查询、成绩表格展示、新成绩QQ监听通知。纯HTTP登录，无Playwright依赖。
-short_desc: 智学网成绩查询，多用户支持，自动监听新成绩
+desc: 智学网成绩查询插件 - 支持多用户绑定、考试列表查询、成绩表格展示、答题卡批改标注渲染（总分/错题红框/分小问扣分明细）、新成绩QQ监听通知。纯HTTP登录，无Playwright依赖。
+short_desc: 智学网成绩查询，答题卡批改标注渲染，自动监听新成绩
 author: zhixuemore
-version: 2.1.0
+version: 2.3.0
 support_platforms:
   - aiocqhttp

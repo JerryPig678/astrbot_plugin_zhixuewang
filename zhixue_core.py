@@ -1,8 +1,8 @@
 import asyncio
 import json
 import logging
-import os
 import hashlib
+import os
 import time
 
 from .zhixue_api import login_cookie
@@ -15,6 +15,9 @@ ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 BINDINGS_FILE = os.path.join(DATA_DIR, "bindings.json")  # legacy, for migration
 SCORES_FILE = os.path.join(DATA_DIR, "scores.json")
 COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
+
+
+_WATCH_WINDOW = 3  # 监听窗口：最近 3 场考试
 
 
 def _safe_name(username: str) -> str:
@@ -267,89 +270,180 @@ class ZhiXueManager:
     async def get_marks(self, user_id: str, config_users: list, exam_param: str = None) -> tuple:
         account, _ = await self.get_account(user_id, config_users)
         user_name = account.name
-        exam = None
-        if exam_param is not None:
-            exam_str = str(exam_param)
-            if exam_str.isdigit():
-                idx = int(exam_str) - 1
-                exams = self._get_cached_exams(account)
-                if idx < 0 or idx >= len(exams):
-                    raise ValueError(f"序号 {exam_param} 超出范围，共 {len(exams)} 场考试")
-                exam = exams[idx].get("_exam_obj") or exams[idx]
-            else:
-                for e in account.get_exams():
-                    en = getattr(e, "name", str(e))
-                    if exam_str in en:
-                        exam = e
-                        break
-                if exam is None:
-                    raise ValueError(f"未找到考试: {exam_param}")
-            marks = account.get_self_mark(exam)
-        else:
-            marks = account.get_self_mark()
+        exam = self._resolve_exam_or_latest(account, exam_param)
+
+        papers, total_raw = account.get_report_main(exam)
 
         subjects = []
         total_info = None
-        if marks:
-            for m in marks:
-                code = getattr(m.subject, "code", "") if hasattr(m, "subject") else ""
-                if code == "99":
-                    total_info = {
-                        "name": getattr(m.subject, "name", "总分"),
-                        "score": getattr(m, "score", None),
-                        "standard_score": getattr(m.subject, "standard_score", None),
-                    }
-                    continue
-                subjects.append({
-                    "subject": getattr(m.subject, "name", getattr(m, "subject_name", "未知")),
-                    "score": getattr(m, "score", None),
-                    "standard_score": getattr(m, "standard_score", None),
-                    "class_rank": getattr(m, "class_rank", None),
-                    "grade_rank": getattr(m, "grade_rank", None),
-                })
+        for p in papers:
+            if p["subject_code"] == "99":
+                total_info = {
+                    "name": p["subject_name"],
+                    "score": p["score"],
+                    "standard_score": p["standard_score"],
+                }
+                continue
+            subjects.append({
+                "subject": p["subject_name"],
+                "score": p["score"],
+                "standard_score": p["standard_score"],
+                "class_rank": 0,
+                "grade_rank": 0,
+            })
+
+        # Prefer totalScore from API root (more reliable)
+        if total_raw:
+            total_info = {
+                "name": total_raw.get("subjectName", "总分"),
+                "score": total_raw["userScore"],
+                "standard_score": total_raw["standardScore"],
+            }
 
         if total_info is None and subjects:
             total = sum(s["score"] for s in subjects if s.get("score") is not None)
             total_info = {"name": "总分", "score": total, "standard_score": None}
 
-        exam_info = {}
-        if marks and len(marks) > 0:
-            e = getattr(marks[0], "exam", None)
-            if e:
-                exam_info = {"name": getattr(e, "name", "未知"), "id": getattr(e, "id", "")}
-            else:
-                exam_info = exam_param and {"name": exam_param} or {}
+        # Rank info is best-effort (builds Mark internally, catches failures)
+        try:
+            from .zhixue_api import Mark, SubjectScore, Subject
+            mark = Mark(exam=exam, person_name=user_name)
+            for p in papers:
+                if p["subject_code"] == "99":
+                    continue
+                mark.append(SubjectScore(
+                    score=p["score"],
+                    subject=Subject(
+                        id=p["paper_id"], name=p["subject_name"],
+                        code=p["subject_code"], standard_score=p["standard_score"],
+                        exam_id=exam.id,
+                    ),
+                ))
+            account._set_exam_rank(exam, mark)
+            for m in mark:
+                for s in subjects:
+                    if s["subject"] == m.subject.name:
+                        s["class_rank"] = m.class_rank
+                        s["grade_rank"] = m.grade_rank
+        except Exception:
+            logger.debug(f"获取排名信息失败: user={user_id}", exc_info=True)
+
+        exam_info = {"name": exam.name, "id": exam.id}
         return user_name, exam_info, subjects, total_info
 
+    async def get_sheet(self, user_id: str, config_users: list, subject_name: str, exam_param: str = None) -> tuple[str, list[str]]:
+        """获取答题卡图片临时文件路径。返回 (sheet_name, [path1, path2, ...])。"""
+        account, _ = await self.get_account(user_id, config_users)
+        exam = self._resolve_exam_or_latest(account, exam_param)
+
+        papers, _ = account.get_report_main(exam)
+
+        # 匹配学科
+        paper_id = None
+        sheet_name = ""
+        for p in papers:
+            if subject_name in p["subject_name"] or p["subject_name"] == subject_name:
+                paper_id = p["paper_id"]
+                sheet_name = p["subject_name"]
+                break
+
+        if not paper_id:
+            names = ", ".join(p["subject_name"] for p in papers)
+            raise ValueError(f"未找到「{subject_name}」，该考试包含：{names}")
+
+        temp_paths = await asyncio.to_thread(
+            account.download_sheet_images, exam.id, paper_id
+        )
+        if not temp_paths:
+            raise ValueError(f"「{sheet_name}」答题卡图片暂未上传")
+        return sheet_name, temp_paths
+
+    def _resolve_exam_or_latest(self, account, exam_param: str = None):
+        """解析考试参数（序号或名称），返回 Exam 对象。None 时取最新考试。"""
+        if exam_param is None:
+            exam = account.get_latest_exam()
+            if not exam:
+                raise ValueError("未找到任何考试")
+            return exam
+        exams = self._get_cached_exams(account)
+        exam_str = str(exam_param)
+        if exam_str.isdigit():
+            idx = int(exam_str) - 1
+            if idx < 0 or idx >= len(exams):
+                raise ValueError(f"序号 {exam_param} 超出范围，共 {len(exams)} 场考试")
+            return exams[idx].get("_exam_obj") or exams[idx]
+        for e in exams:
+            en = e.get("name", "")
+            if exam_str in en:
+                return e.get("_exam_obj") or e
+        raise ValueError(f"未找到考试: {exam_param}")
+
     async def check_new_scores(self, user_id: str, config_users: list) -> list:
+        """检查最近 3 场考试的成绩变化。
+
+        检测两种变化：
+          - 新考试出现（考试名不在本地记录中）
+          - 已有考试有新学科或有学科分数变化（hash 签名变化）
+
+        返回:
+          [{"exam": str, "subjects": [{"subject": str, "score": float}], "change_type": "new_exam"|"updated"}]
+        """
         account, _ = await self.get_account(user_id, config_users)
         username = self._find_username(user_id, config_users)
-        all_scores = load_scores()
         user_key = username or user_id
-        user_scores = all_scores.get(user_key, {})
 
-        new_items = []
-        try:
-            marks = account.get_self_mark()
-            if marks:
-                e = getattr(marks[0], "exam", None)
-                exam_name = getattr(e, "name", "") if e else "latest"
-                if exam_name not in user_scores:
-                    subs = []
-                    for m in marks:
-                        code = getattr(m.subject, "code", "") if hasattr(m, "subject") else ""
-                        if code == "99":
-                            continue
-                        subs.append({
-                            "subject": getattr(m.subject, "name", "?"),
-                            "score": getattr(m, "score", None),
-                        })
-                    new_items.append({"exam": exam_name, "subjects": subs})
-                    user_scores[exam_name] = {"timestamp": time.time()}
-                    all_scores[user_key] = user_scores
-                    save_scores(all_scores)
-        except Exception:
-            pass
+        # 1. 取最近 3 场考试
+        all_exams = account.get_exams()
+        recent = all_exams[:_WATCH_WINDOW]
+        if not recent:
+            return []
+
+        # 2. 取每场的学科成绩快照：exam_name -> {subject_name: score}
+        current_snapshot: dict[str, dict[str, float]] = {}
+        for exam in recent:
+            try:
+                marks = account.get_self_mark(exam)
+                subjects: dict[str, float] = {}
+                for m in marks:
+                    code = getattr(m.subject, "code", "") if hasattr(m, "subject") else ""
+                    if code == "99":
+                        continue  # 跳过总分
+                    name = getattr(m.subject, "name", "?")
+                    score = getattr(m, "score", None)
+                    if score is not None:
+                        subjects[name] = score
+                current_snapshot[exam.name] = subjects
+            except Exception:
+                logger.debug(f"[监听] 获取考试「{exam.name}」成绩失败", exc_info=True)
+
+        if not current_snapshot:
+            return []
+
+        # 3. 对比本地记录
+        all_scores = load_scores()
+        saved = all_scores.get(user_key, {})
+        new_items: list[dict] = []
+
+        for exam_name, subjects in current_snapshot.items():
+            if exam_name not in saved:
+                # -- 全新考试 --
+                subs = [{"subject": k, "score": v} for k, v in subjects.items()]
+                new_items.append({"exam": exam_name, "subjects": subs, "change_type": "new_exam"})
+                saved[exam_name] = subjects
+            else:
+                # -- 已有考试：逐学科对比 --
+                old_subs = saved.get(exam_name, {})
+                new_subs: list[dict] = []
+                for subj, score in subjects.items():
+                    if subj not in old_subs or old_subs[subj] != score:
+                        new_subs.append({"subject": subj, "score": score})
+                if new_subs:
+                    new_items.append({"exam": exam_name, "subjects": new_subs, "change_type": "updated"})
+                    saved[exam_name] = subjects  # 更新快照
+
+        if new_items:
+            all_scores[user_key] = saved
+            save_scores(all_scores)
 
         return new_items
 

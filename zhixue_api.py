@@ -11,12 +11,16 @@ Only implements the functions the plugin actually uses:
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
 from curl_cffi import requests
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # URLs
@@ -32,6 +36,7 @@ _GET_MARK_URL = f"{_BASE}/zhixuebao/report/exam/getReportMain"
 _GET_EXAM_LEVEL_TREND_URL = f"{_BASE}/zhixuebao/report/exam/getLevelTrend"
 _GET_PAPER_LEVEL_TREND_URL = f"{_BASE}/zhixuebao/report/paper/getLevelTrend"
 _GET_SUBJECT_DIAGNOSIS = f"{_BASE}/zhixuebao/report/exam/getSubjectDiagnosis"
+_GET_SHEET_URL = f"{_BASE}/zhixuebao/report/checksheet/"
 
 _MD5_SECRET = "iflytek!@#123student"
 
@@ -279,18 +284,123 @@ class StudentAccount:
             ))
 
         # Fetch rank info (best-effort)
-        self._set_exam_rank(mark)
+        self._set_exam_rank(exam, mark)
         return mark
 
-    def _set_exam_rank(self, mark: Mark):
+    def get_report_main(self, exam: Exam) -> tuple[list, dict | None]:
+        """从 getReportMain 获取学科列表和总分数据。"""
+        r = self._session.get(
+            _GET_MARK_URL,
+            params={"examId": exam.id},
+            headers=self._get_auth_header(),
+        )
+        r.raise_for_status()
+        result = r.json()["result"]
+        papers = []
+        for p in result["paperList"]:
+            papers.append({
+                "paper_id": p["paperId"],
+                "subject_name": p["subjectName"],
+                "subject_code": p["subjectCode"],
+                "score": p["userScore"],
+                "standard_score": p["standardScore"],
+            })
+        total_raw = result.get("totalScore")
+        return papers, total_raw
+
+    def get_sheet_payload(self, exam_id: str, paper_id: str) -> dict | None:
+        """获取答题卡完整数据: 图片 URL + 定位数据 + 分步满分. 无答题卡时返回 None."""
+        r = self._session.get(
+            _GET_SHEET_URL,
+            params={"examId": exam_id, "paperId": paper_id},
+            headers=self._get_auth_header(),
+        )
+        r.raise_for_status()
+        result = r.json().get("result")
+        if not result:
+            return None
+        sheet_images_raw = result.get("sheetImages")
+        if not sheet_images_raw:
+            return None
+        sheet_datas = {}
         try:
-            year = mark.exam.academic_year
+            sheet_datas = json.loads(result.get("sheetDatas") or "{}")
+        except (ValueError, TypeError):
+            pass
+        return {
+            "image_urls": json.loads(sheet_images_raw),
+            "sheet_datas": sheet_datas,
+            "step_datas": result.get("stepDatas") or [],
+            "score": result.get("score"),
+            "standard_score": result.get("standardScore"),
+        }
+
+    def get_sheet_images(self, exam_id: str, paper_id: str) -> list[str]:
+        """获取答题卡图片 URL 列表。"""
+        payload = self.get_sheet_payload(exam_id, paper_id)
+        return payload["image_urls"] if payload else []
+
+    def download_sheet_images(self, exam_id: str, paper_id: str) -> list[str]:
+        """下载答题卡图片(批注渲染后拼接长图)到临时文件，返回路径列表。调用方负责清理。"""
+        import io
+        import tempfile
+
+        from PIL import Image
+
+        from .answer_sheet import annotate_page, build_score_map
+
+        payload = self.get_sheet_payload(exam_id, paper_id)
+        if not payload:
+            return []
+
+        raw_pages = []
+        for url in payload["image_urls"]:
+            img_resp = self._session.get(url)
+            img_resp.raise_for_status()
+            raw_pages.append(img_resp.content)
+
+        score_map = build_score_map(payload["sheet_datas"], payload.get("step_datas"))
+        pages = (payload["sheet_datas"].get("answerSheetLocationDTO") or {}).get("pageSheets") or []
+
+        rendered: list = []
+        for idx, raw in enumerate(raw_pages):
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            if idx < len(pages):
+                annotate_page(img, pages[idx], score_map)
+            rendered.append(img)
+
+        temp_paths = []
+        if rendered:
+            max_w = max(p.width for p in rendered)
+            scaled = []
+            for p in rendered:
+                if p.width != max_w:
+                    p = p.resize((max_w, int(p.height * max_w / p.width)), Image.LANCZOS)
+                scaled.append(p)
+            total_h = sum(p.height for p in scaled)
+            merged = Image.new("RGB", (max_w, total_h), "white")
+            y = 0
+            for p in scaled:
+                merged.paste(p, (0, y))
+                y += p.height
+            buf = io.BytesIO()
+            merged.save(buf, format="JPEG", quality=90)
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            tmp.write(buf.getvalue())
+            tmp.close()
+            temp_paths.append(tmp.name)
+        return temp_paths
+
+    def _set_exam_rank(self, exam: Exam, mark: Mark):
+        """Fetch rank info and populate class_rank on each SubjectScore."""
+        try:
+            year = exam.academic_year
             if not year.begin_time:
                 return
             r = self._session.get(
                 _GET_EXAM_LEVEL_TREND_URL,
                 params={
-                    "examId": mark.exam.id,
+                    "examId": exam.id,
                     "pageIndex": 1, "pageSize": 1,
                     "startSchoolYear": year.begin_time,
                     "endSchoolYear": year.end_time,
@@ -307,7 +417,7 @@ class StudentAccount:
 
             r2 = self._session.get(
                 _GET_SUBJECT_DIAGNOSIS,
-                params={"examId": mark.exam.id},
+                params={"examId": exam.id},
                 headers=self._get_auth_header(),
             )
             data2 = r2.json()
@@ -318,7 +428,7 @@ class StudentAccount:
                     if ss.subject.code == each["subjectCode"]:
                         ss.class_rank = round(total_num - (100 - each["myRank"]) / 100 * (total_num - 1))
         except Exception:
-            pass  # rank info is best-effort
+            logger.debug(f"获取排名信息失败 (exam={exam.id})", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
