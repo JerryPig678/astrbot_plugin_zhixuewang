@@ -475,39 +475,48 @@ class ZhiXuePlugin(Star):
             return f"查询失败: {e}"
 
     @filter.llm_tool(name="zhixue_query_sheet")
-    async def llm_query_sheet(self, event: AstrMessageEvent, user_id: str, subject_name: str, exam_name: str = "") -> MessageEventResult:
-        '''查询学生某次考试某学科的答题卡图片。必须指定学科名称，考试名可选。
+    async def llm_query_sheet(self, event: AstrMessageEvent, user_id: str, subject_name: str, exam_name: str = "") -> str:
+        '''查询学生某次考试某学科的答题卡图片（含批改标注）。必须指定学科名称，考试名可选。图片会直接发送给用户。
 
         Args:
             user_id(string): 要查询的用户ID。从上下文 user_context 获取：查自己用发送者ID，查别人用被@用户的ID
             subject_name(string): 学科名称，如"数学"、"语文"等，支持模糊匹配
             exam_name(string): 考试名称关键词，可选，不传则查询最新考试
         '''
+        import os
+
+        from astrbot.api.event import MessageChain
+
         try:
             config_users = self.config.get("users", [])
             accounts = load_accounts(config_users)
             zx_username = find_username_by_id(accounts, user_id)
             if not zx_username:
-                yield event.plain_result(f"用户 {user_id} 未绑定智学网账号，请先使用 /zx bind 绑定")
-                return
+                return f"用户 {user_id} 未绑定智学网账号，请先使用 /zx bind 绑定"
             exam_param = exam_name if exam_name else None
             sheet_name, temp_paths = await zhixue_manager.get_sheet(
                 user_id, config_users, subject_name, exam_param
             )
-            import os
             try:
+                umo = getattr(event, "unified_msg_origin", "") or ""
+                if not umo:
+                    return "无法确定发送目标会话，请改用 /zx sheet 命令查询"
                 for path in temp_paths:
-                    yield event.image_result(path)
-                yield event.plain_result(
-                    f"已发送「{sheet_name}」答题卡图片，共 {len(temp_paths)} 页。"
-                )
+                    chain = MessageChain()
+                    chain.chain.append(Image.fromFileSystem(path))
+                    await self.context.send_message(umo, chain)
             finally:
                 for path in temp_paths:
                     try:
                         os.unlink(path)
                     except OSError:
                         pass
+            return (
+                f"已向用户发送「{sheet_name}」答题卡图片（共 {len(temp_paths)} 张长图，"
+                f"含总分、错题红框、分小问扣分明细批注）。可以提示用户查看图片。"
+            )
         except ValueError as e:
-            yield event.plain_result(str(e))
+            return str(e)
         except Exception as e:
-            yield event.plain_result(f"查询答题卡失败: {e}")
+            logger.warning(f"zhixue_query_sheet 失败: {e}", exc_info=True)
+            return f"查询答题卡失败: {e}"
