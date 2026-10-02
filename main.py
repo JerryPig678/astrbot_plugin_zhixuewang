@@ -11,6 +11,7 @@ from .zhixue_core import (
     zhixue_manager,
     load_accounts,
     find_username_by_id,
+    format_exam_date,
     format_exams_table,
     format_marks_table,
 )
@@ -28,18 +29,20 @@ body { font-family:'Courier New',Consolas,'Microsoft YaHei',monospace; backgroun
 .container { max-width:480px; margin:0 auto; }
 </style></head>
 <body><div class="container">
-  <div style="font-size:18px; font-weight:bold; border-bottom:2px solid #000; padding-bottom:8px; margin-bottom:12px; letter-spacing:2px;">
+  <div style="font-size:18px; font-weight:bold; border-bottom:2px solid #000; padding-bottom:8px; margin-bottom:4px; letter-spacing:2px;">
     EXAM LIST
   </div>
+  {% if year_label %}<div style="font-size:12px; color:#666; margin-bottom:12px;">{{ year_label }}</div>{% else %}<div style="margin-bottom:12px;"></div>{% endif %}
   {% for exam in exams %}
   <div style="padding:6px 0; border-bottom:1px dashed #ccc; font-size:14px;">
     <span style="font-weight:bold; margin-right:6px;">{{ "%02d"|format(loop.index) }}.</span>
     <span>{{ exam.name }}</span>
+    {% if exam.date %}<span style="margin-left:6px; font-size:11px; color:#888;">{{ exam.date }}</span>{% endif %}
     {% if exam.is_final %}<span style="margin-left:6px; font-size:11px; color:#fff; background:#000; padding:1px 4px;">FINAL</span>{% endif %}
   </div>
   {% endfor %}
   <div style="margin-top:12px; font-size:12px; color:#888; border-top:1px solid #000; padding-top:8px;">
-    &gt; /zx marks &lt;no&gt;
+    &gt; /zx marks &lt;no&gt;{% if hint %}<br>&gt; {{ hint }}{% endif %}
   </div>
 </div></body></html>'''
 
@@ -208,7 +211,7 @@ class ZhiXuePlugin(Star):
         help_text = (
             "智学网成绩查询\n"
             "  /zx bind <用户名>    - 绑定智学网账号\n"
-            "  /zx exams            - 查看考试列表\n"
+            "  /zx exams [all]      - 查看考试列表，默认本学年，all 查看全部\n"
             "  /zx marks [序号/名称] - 查看成绩\n"
             "  /zx sheet <学科> [考试] - 查看答题卡(带批改标注长图)\n"
             "  /zx watch on [间隔]|off - 开启/停止成绩监听\n"
@@ -256,19 +259,35 @@ class ZhiXuePlugin(Star):
         )
 
     @zx.command("exams")
-    async def zx_exams(self, event: AstrMessageEvent):
-        '''查看考试列表'''
+    async def zx_exams(self, event: AstrMessageEvent, scope: str = None):
+        '''查看考试列表，默认本学年，加 all 查看全部'''
+        show_all = bool(scope) and scope.lower() == "all"
         yield event.plain_result("正在查询考试列表...")
         try:
             config_users = self.config.get("users", [])
-            exams = await zhixue_manager.get_exams(event.get_sender_id(), config_users)
+            exams = await zhixue_manager.get_exams(
+                event.get_sender_id(), config_users, all_years=show_all
+            )
+            year_label = "" if show_all or not exams else (exams[0].get("year_name") or "")
+            hint = "" if show_all else "/zx exams all 查看全部学年"
             try:
-                data = {"exams": [{"name": e.get("name", "?"), "is_final": e.get("is_final", False)} for e in exams]}
+                data = {
+                    "year_label": year_label,
+                    "hint": hint,
+                    "exams": [
+                        {
+                            "name": e.get("name", "?"),
+                            "is_final": e.get("is_final", False),
+                            "date": format_exam_date(e.get("create_time")),
+                        }
+                        for e in exams
+                    ],
+                }
                 url = await self._render_image(EXAMS_TMPL, data)
                 yield event.image_result(url)
             except Exception as t2i_err:
                 logger.warning(f"t2i渲染失败，降级纯文本: {t2i_err}")
-                yield event.plain_result(format_exams_table(exams))
+                yield event.plain_result(format_exams_table(exams, show_all=show_all))
         except ValueError as e:
             yield event.plain_result(str(e))
         except Exception as e:
@@ -431,7 +450,7 @@ class ZhiXuePlugin(Star):
 
     @filter.llm_tool(name="zhixue_list_exams")
     async def llm_list_exams(self, event: AstrMessageEvent, user_id: str) -> MessageEventResult:
-        '''查询学生的考试列表。在查询成绩前必须先调用此工具获取准确的考试名称。
+        '''查询学生的考试列表（默认只显示本学年）。在查询成绩前必须先调用此工具获取准确的考试名称。
 
         Args:
             user_id(string): 要查询的用户ID。从上下文 user_context 获取：查自己用发送者ID，查别人用被@用户的ID

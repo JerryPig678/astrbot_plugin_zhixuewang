@@ -253,19 +253,37 @@ class ZhiXueManager:
         exams_raw = account.get_exams()
         exams = []
         for exam in exams_raw:
+            year = getattr(exam, "academic_year", None)
             exams.append({
                 "id": getattr(exam, "id", ""),
                 "name": getattr(exam, "name", str(exam)),
                 "is_final": getattr(exam, "is_final", False),
                 "grade_code": getattr(exam, "grade_code", ""),
+                "create_time": getattr(exam, "create_time", 0) or 0,
+                "year_name": getattr(year, "name", ""),
+                "year_code": getattr(year, "code", ""),
                 "_exam_obj": exam,
             })
         self._exams_cache[name] = (exams, now)
         return exams
 
-    async def get_exams(self, user_id: str, config_users: list) -> list:
+    @staticmethod
+    def _filter_current_year(exams: list) -> list:
+        """只保留最新一场考试所属学年的考试"""
+        if not exams:
+            return exams
+        latest = max(exams, key=lambda e: e.get("create_time") or 0)
+        year_code = latest.get("year_code", "")
+        if not year_code:
+            return exams
+        return [e for e in exams if e.get("year_code") == year_code]
+
+    async def get_exams(self, user_id: str, config_users: list, all_years: bool = False) -> list:
         account, _ = await self.get_account(user_id, config_users)
-        return self._get_cached_exams(account)
+        exams = self._get_cached_exams(account)
+        if all_years:
+            return exams
+        return self._filter_current_year(exams)
 
     async def get_marks(self, user_id: str, config_users: list, exam_param: str = None) -> tuple:
         account, _ = await self.get_account(user_id, config_users)
@@ -359,20 +377,27 @@ class ZhiXueManager:
         return sheet_name, temp_paths
 
     def _resolve_exam_or_latest(self, account, exam_param: str = None):
-        """解析考试参数（序号或名称），返回 Exam 对象。None 时取最新考试。"""
+        """解析考试参数（序号或名称），返回 Exam 对象。None 时取最新考试。
+
+        序号与 /zx exams 默认展示的本学年列表一致；名称模糊匹配搜索全部学年。
+        """
         if exam_param is None:
             exam = account.get_latest_exam()
             if not exam:
                 raise ValueError("未找到任何考试")
             return exam
-        exams = self._get_cached_exams(account)
+        exams_all = self._get_cached_exams(account)
         exam_str = str(exam_param)
         if exam_str.isdigit():
+            exams = self._filter_current_year(exams_all)
             idx = int(exam_str) - 1
             if idx < 0 or idx >= len(exams):
-                raise ValueError(f"序号 {exam_param} 超出范围，共 {len(exams)} 场考试")
+                raise ValueError(
+                    f"序号 {exam_param} 超出范围，本学年共 {len(exams)} 场考试，"
+                    f"可用 /zx exams all 查看全部后按名称查询"
+                )
             return exams[idx].get("_exam_obj") or exams[idx]
-        for e in exams:
+        for e in exams_all:
             en = e.get("name", "")
             if exam_str in en:
                 return e.get("_exam_obj") or e
@@ -451,15 +476,34 @@ class ZhiXueManager:
 zhixue_manager = ZhiXueManager()
 
 
-def format_exams_table(exams: list) -> str:
+def format_exam_date(ts) -> str:
+    """考试创建时间戳转日期，兼容秒/毫秒"""
+    try:
+        ts = float(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    if ts > 1e12:
+        ts /= 1000
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def format_exams_table(exams: list, show_all: bool = False) -> str:
     if not exams:
         return "暂无考试数据"
-    lines = ["考试列表：", ""]
+    year_name = "" if show_all else (exams[0].get("year_name") or "")
+    title = f"考试列表（{year_name}）：" if year_name else "考试列表："
+    lines = [title, ""]
     for i, e in enumerate(exams, 1):
         name = e.get("name", "?")
         is_final = " [期末]" if e.get("is_final") else ""
-        lines.append(f"  {i}. {name}{is_final}")
+        date = format_exam_date(e.get("create_time"))
+        date_part = f" {date}" if date else ""
+        lines.append(f"  {i}. {name}{date_part}{is_final}")
     lines.append("")
+    if not show_all and year_name:
+        lines.append("发送 /zx exams all 查看全部学年考试")
     lines.append("发送 /zx marks <序号或考试名> 查询对应成绩")
     return "\n".join(lines)
 
