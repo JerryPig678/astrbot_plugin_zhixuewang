@@ -340,14 +340,14 @@ class StudentAccount:
         payload = self.get_sheet_payload(exam_id, paper_id)
         return payload["image_urls"] if payload else []
 
-    def download_sheet_images(self, exam_id: str, paper_id: str) -> list[str]:
-        """下载答题卡图片(批注渲染后拼接长图)到临时文件，返回路径列表。调用方负责清理。"""
+    def download_sheet_images(self, exam_id: str, paper_id: str, title: str = "") -> list[str]:
+        """下载答题卡图片(批注渲染+总分栏+拼接长图)到临时文件，返回路径列表。调用方负责清理。"""
         import io
         import tempfile
 
         from PIL import Image
 
-        from .answer_sheet import annotate_page, build_score_map
+        from .answer_sheet import add_score_bar, annotate_page, build_score_map
 
         payload = self.get_sheet_payload(exam_id, paper_id)
         if not payload:
@@ -369,11 +369,16 @@ class StudentAccount:
                 annotate_page(img, pages[idx], score_map)
             rendered.append(img)
 
+        final = [
+            add_score_bar(img, payload.get("score"), payload.get("standard_score"), title)
+            for img in rendered
+        ]
+
         temp_paths = []
-        if rendered:
-            max_w = max(p.width for p in rendered)
+        if final:
+            max_w = max(p.width for p in final)
             scaled = []
-            for p in rendered:
+            for p in final:
                 if p.width != max_w:
                     p = p.resize((max_w, int(p.height * max_w / p.width)), Image.LANCZOS)
                 scaled.append(p)

@@ -370,7 +370,8 @@ class ZhiXueManager:
             raise ValueError(f"未找到「{subject_name}」，该考试包含：{names}")
 
         temp_paths = await asyncio.to_thread(
-            account.download_sheet_images, exam.id, paper_id
+            account.download_sheet_images, exam.id, paper_id,
+            f"{getattr(exam, 'name', '')}  {sheet_name}".strip(),
         )
         if not temp_paths:
             raise ValueError(f"「{sheet_name}」答题卡图片暂未上传")
