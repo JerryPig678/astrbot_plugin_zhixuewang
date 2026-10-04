@@ -669,3 +669,95 @@ class ZhiXuePlugin(Star):
         except Exception as e:
             logger.warning(f"zhixue_query_sheet 失败: {e}", exc_info=True)
             return f"查询答题卡失败: {e}"
+
+    @filter.llm_tool(name="zhixue_list_homeworks")
+    async def llm_list_homeworks(self, event: AstrMessageEvent, user_id: str) -> str:
+        '''查询学生的手阅作业列表（最近 10 条）。在查询作业成绩前必须先调用此工具获取准确的作业名称。
+
+        Args:
+            user_id(string): 要查询的用户ID。从上下文 user_context 获取：查自己用发送者ID，查别人用被@用户的ID
+        '''
+        try:
+            config_users = self.config.get("users", [])
+            accounts = load_accounts(config_users)
+            zx_username = find_username_by_id(accounts, user_id)
+            if not zx_username:
+                return f"用户 {user_id} 未绑定智学网账号，请先使用 /zx bind 绑定"
+            hws = await zhixue_manager.get_homeworks(user_id, config_users)
+            return format_homeworks_table(hws[:10])
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            return f"查询失败: {e}"
+
+    @filter.llm_tool(name="zhixue_query_homework_score")
+    async def llm_query_homework_score(self, event: AstrMessageEvent, user_id: str, homework_name: str = "") -> str:
+        '''查询学生某次手阅作业的成绩。不传 homework_name 则查询最新作业，传 homework_name 则查询指定作业。
+
+        Args:
+            user_id(string): 要查询的用户ID。从上下文 user_context 获取：查自己用发送者ID，查别人用被@用户的ID
+            homework_name(string): 作业名称关键词，支持模糊匹配。不传则查询最新作业
+        '''
+        try:
+            config_users = self.config.get("users", [])
+            accounts = load_accounts(config_users)
+            zx_username = find_username_by_id(accounts, user_id)
+            if not zx_username:
+                return f"用户 {user_id} 未绑定智学网账号，请先使用 /zx bind 绑定"
+            hw_param = homework_name if homework_name else None
+            user_name, hw_info, subjects, total_info = await zhixue_manager.get_homework_marks(
+                user_id, config_users, hw_param
+            )
+            hname = hw_info.get("name", "最新作业")
+            return format_marks_table(user_name, hname, subjects, total_info)
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            return f"查询失败: {e}"
+
+    @filter.llm_tool(name="zhixue_query_homework_sheet")
+    async def llm_query_homework_sheet(self, event: AstrMessageEvent, user_id: str, subject_name: str, homework_name: str = "") -> str:
+        '''查询学生某次手阅作业某学科的答题卡图片（含批改标注）。必须指定学科名称，作业名可选。图片会直接发送给用户。
+
+        Args:
+            user_id(string): 要查询的用户ID。从上下文 user_context 获取：查自己用发送者ID，查别人用被@用户的ID
+            subject_name(string): 学科名称，如"数学"、"语文"等，支持模糊匹配
+            homework_name(string): 作业名称关键词，可选，不传则查询最新作业
+        '''
+        import os
+
+        from astrbot.api.event import MessageChain
+
+        try:
+            config_users = self.config.get("users", [])
+            accounts = load_accounts(config_users)
+            zx_username = find_username_by_id(accounts, user_id)
+            if not zx_username:
+                return f"用户 {user_id} 未绑定智学网账号，请先使用 /zx bind 绑定"
+            hw_param = homework_name if homework_name else None
+            sheet_name, temp_paths = await zhixue_manager.get_homework_sheet(
+                user_id, config_users, subject_name, hw_param
+            )
+            try:
+                umo = getattr(event, "unified_msg_origin", "") or ""
+                if not umo:
+                    return "无法确定发送目标会话，请改用 /zx hw sheet 命令查询"
+                for path in temp_paths:
+                    chain = MessageChain()
+                    chain.chain.append(Image.fromFileSystem(path))
+                    await self.context.send_message(umo, chain)
+            finally:
+                for path in temp_paths:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+            return (
+                f"已向用户发送「{sheet_name}」作业答题卡图片（共 {len(temp_paths)} 张长图，"
+                f"含总分、错题红框、题级得分批注）。可以提示用户查看图片。"
+            )
+        except ValueError as e:
+            return str(e)
+        except Exception as e:
+            logger.warning(f"zhixue_query_homework_sheet 失败: {e}", exc_info=True)
+            return f"查询作业答题卡失败: {e}"

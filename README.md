@@ -78,11 +78,14 @@ UMO 格式示例：`aiocqhttp:GroupMessage:123456`
 
 ## LLM 工具
 
-插件注册了三个工具供 AI 调用：
+插件注册了六个工具供 AI 调用：
 
 * `zhixue_list_exams(user_id)` — 获取考试列表
 * `zhixue_query_score(user_id, exam_name)` — 查询成绩
 * `zhixue_query_sheet(user_id, subject_name, exam_name)` — 查询答题卡（直接发图）
+* `zhixue_list_homeworks(user_id)` — 获取手阅作业列表
+* `zhixue_query_homework_score(user_id, homework_name)` — 查询作业成绩
+* `zhixue_query_homework_sheet(user_id, subject_name, homework_name)` — 查询作业答题卡（直接发图）
 
 通过 `on_llm_request` 钩子注入用户上下文（发送者 ID、被@用户 ID），AI 可自动识别查谁的成绩。
 
