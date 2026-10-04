@@ -14,10 +14,12 @@ DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 BINDINGS_FILE = os.path.join(DATA_DIR, "bindings.json")  # legacy, for migration
 SCORES_FILE = os.path.join(DATA_DIR, "scores.json")
+HOMEWORKS_FILE = os.path.join(DATA_DIR, "homeworks.json")
 COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
 
 
 _WATCH_WINDOW = 3  # 监听窗口：最近 3 场考试
+_HW_WATCH_PAGE_SIZE = 10  # 监听窗口：最近 10 个手阅作业
 
 
 def _safe_name(username: str) -> str:
@@ -166,6 +168,18 @@ def save_scores(scores: dict):
         json.dump(scores, f, ensure_ascii=False, indent=2)
 
 
+def load_homeworks() -> dict:
+    if os.path.exists(HOMEWORKS_FILE):
+        with open(HOMEWORKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_homeworks(data: dict):
+    with open(HOMEWORKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def _http_login(username: str, password: str, print_fn=None) -> dict:
     """Pure-HTTP login via plugin_login (no Playwright)."""
     from .plugin_login import http_login
@@ -191,6 +205,7 @@ class ZhiXueManager:
         self.log = log_fn or print
         self._login_lock = asyncio.Lock()
         self._exams_cache: dict = {}  # username -> (exams_list, timestamp)
+        self._hw_cache: dict = {}  # username -> (homeworks_list, timestamp)
 
     def _find_username(self, user_id: str, config_users: list = None) -> str | None:
         accounts = load_accounts(config_users)
@@ -377,6 +392,151 @@ class ZhiXueManager:
             raise ValueError(f"「{sheet_name}」答题卡图片暂未上传")
         return sheet_name, temp_paths
 
+    # ------------------------------------------------------------------
+    # 手阅作业（zxbReport 接口，网页版无入口）
+    # ------------------------------------------------------------------
+
+    def _get_cached_homeworks(self, account) -> list:
+        """手阅作业列表，5 分钟缓存，自动翻页拉全。"""
+        name = account.name or "default"
+        now = time.time()
+        if name in self._hw_cache:
+            hws, ts = self._hw_cache[name]
+            if now - ts < self._EXAMS_CACHE_TTL:
+                return hws
+        hws: list = []
+        page = 1
+        while page <= 10:  # 安全上限
+            items, has_next = account.get_homework_list(page=page, page_size=20)
+            hws.extend(items)
+            if not has_next or not items:
+                break
+            page += 1
+        self._hw_cache[name] = (hws, now)
+        return hws
+
+    def _resolve_homework_or_latest(self, account, hw_param: str = None) -> dict:
+        """解析作业参数（序号或名称），None 时取最新一条。"""
+        hws = self._get_cached_homeworks(account)
+        if not hws:
+            raise ValueError("没有找到手阅作业")
+        if hw_param is None:
+            return hws[0]
+        hw_str = str(hw_param)
+        if hw_str.isdigit():
+            idx = int(hw_str) - 1
+            if idx < 0 or idx >= len(hws):
+                raise ValueError(
+                    f"序号 {hw_param} 超出范围，共 {len(hws)} 个作业，"
+                    f"可用 /zx hw list all 查看全部"
+                )
+            return hws[idx]
+        for h in hws:
+            if hw_str in h.get("name", ""):
+                return h
+        raise ValueError(f"未找到作业: {hw_param}")
+
+    async def get_homeworks(self, user_id: str, config_users: list) -> list:
+        account, _ = await self.get_account(user_id, config_users)
+        return self._get_cached_homeworks(account)
+
+    async def get_homework_marks(self, user_id: str, config_users: list, hw_param: str = None) -> tuple:
+        """查询手阅作业成绩。返回 (user_name, hw_info, subjects, total_info)。"""
+        account, _ = await self.get_account(user_id, config_users)
+        user_name = account.name
+        hw = self._resolve_homework_or_latest(account, hw_param)
+
+        papers = account.get_homework_report_main(hw["id"])
+        subjects = []
+        total_info = None
+        for p in papers:
+            if p["subject_code"] == "99":
+                total_info = {
+                    "name": p["subject_name"],
+                    "score": p["score"],
+                    "standard_score": p["standard_score"],
+                }
+                continue
+            subjects.append({
+                "subject": p["subject_name"],
+                "score": p["score"],
+                "standard_score": p["standard_score"],
+                "class_rank": 0,
+                "grade_rank": 0,
+            })
+        hw_info = {"name": hw["name"], "id": hw["id"]}
+        return user_name, hw_info, subjects, total_info
+
+    async def get_homework_sheet(self, user_id: str, config_users: list, subject_name: str, hw_param: str = None) -> tuple[str, list[str]]:
+        """获取手阅作业答题卡图片临时文件路径。返回 (sheet_name, [path1, ...])。"""
+        account, _ = await self.get_account(user_id, config_users)
+        hw = self._resolve_homework_or_latest(account, hw_param)
+
+        papers = account.get_homework_report_main(hw["id"])
+        paper_id = None
+        sheet_name = ""
+        for p in papers:
+            if subject_name in p["subject_name"] or p["subject_name"] == subject_name:
+                paper_id = p["paper_id"]
+                sheet_name = p["subject_name"]
+                break
+
+        if not paper_id:
+            names = ", ".join(p["subject_name"] for p in papers)
+            raise ValueError(f"未找到「{subject_name}」，该作业包含：{names}")
+
+        payload = account.get_homework_sheet_payload(hw["id"], paper_id)
+        if not payload:
+            raise ValueError(f"「{sheet_name}」答题卡图片暂未上传")
+        temp_paths = await asyncio.to_thread(
+            account.render_sheet_images, payload,
+            f"{hw.get('name', '')}  {sheet_name}".strip(),
+        )
+        if not temp_paths:
+            raise ValueError(f"「{sheet_name}」答题卡图片暂未上传")
+        return sheet_name, temp_paths
+
+    async def check_new_homeworks(self, user_id: str, config_users: list) -> list:
+        """检查最近手阅作业是否有新增。
+
+        首次运行仅建立基线不推送；之后新作业返回:
+          [{"name": str, "subjects": {subject_name: score}}]
+        """
+        account, _ = await self.get_account(user_id, config_users)
+        username = self._find_username(user_id, config_users)
+        user_key = username or user_id
+
+        recent, _ = account.get_homework_list(page=1, page_size=_HW_WATCH_PAGE_SIZE)
+        if not recent:
+            return []
+
+        all_hw = load_homeworks()
+        saved = all_hw.get(user_key)
+        if saved is None:
+            # 首次运行：建立基线，避免推送历史作业刷屏
+            all_hw[user_key] = {h["name"]: {} for h in recent}
+            save_homeworks(all_hw)
+            return []
+
+        new_items: list[dict] = []
+        for h in recent:
+            if h["name"] in saved:
+                continue
+            subjects: dict[str, float] = {}
+            try:
+                papers = account.get_homework_report_main(h["id"])
+                for p in papers:
+                    subjects[p["subject_name"]] = p.get("score")
+            except Exception:
+                logger.debug(f"[监听] 获取作业「{h['name']}」成绩失败", exc_info=True)
+            new_items.append({"name": h["name"], "subjects": subjects})
+            saved[h["name"]] = subjects
+
+        if new_items:
+            all_hw[user_key] = saved
+            save_homeworks(all_hw)
+        return new_items
+
     def _resolve_exam_or_latest(self, account, exam_param: str = None):
         """解析考试参数（序号或名称），返回 Exam 对象。None 时取最新考试。
 
@@ -524,4 +684,20 @@ def format_marks_table(user_name: str, exam_name: str, subjects: list, total_inf
         lines.append(f"  {subj}: {score_str}{extra_str}")
     if total_info and total_info.get("score") is not None:
         lines.append(f"  {total_info.get('name', '总分')}: {total_info['score']:.1f}")
+    return "\n".join(lines)
+
+
+def format_homeworks_table(hws: list, show_all: bool = False) -> str:
+    shown = hws if show_all else hws[:10]
+    if not shown:
+        return "暂无手阅作业"
+    lines = ["手阅作业列表：", ""]
+    for i, h in enumerate(shown, 1):
+        date = format_exam_date(h.get("create_time"))
+        date_part = f" {date}" if date else ""
+        lines.append(f"  {i}. {h.get('name', '?')}{date_part}")
+    lines.append("")
+    if not show_all and len(hws) > 10:
+        lines.append("发送 /zx hw list all 查看全部")
+    lines.append("发送 /zx hw marks <序号或作业名> 查询作业成绩")
     return "\n".join(lines)

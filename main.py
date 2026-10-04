@@ -14,6 +14,7 @@ from .zhixue_core import (
     format_exam_date,
     format_exams_table,
     format_marks_table,
+    format_homeworks_table,
 )
 
 # ---------------------------------------------------------------------------
@@ -30,7 +31,7 @@ body { font-family:'Courier New',Consolas,'Microsoft YaHei',monospace; backgroun
 </style></head>
 <body><div class="container">
   <div style="font-size:18px; font-weight:bold; border-bottom:2px solid #000; padding-bottom:8px; margin-bottom:4px; letter-spacing:2px;">
-    EXAM LIST
+    {{ title }}
   </div>
   {% if year_label %}<div style="font-size:12px; color:#666; margin-bottom:12px;">{{ year_label }}</div>{% else %}<div style="margin-bottom:12px;"></div>{% endif %}
   {% for exam in exams %}
@@ -191,6 +192,37 @@ class ZhiXuePlugin(Star):
                     except Exception as e:
                         logger.warning(f"[监听] {username} 失败: {e}")
 
+                    # -- 手阅作业监听 --
+                    try:
+                        first_id = bound_ids[0].get("user_id", "")
+                        new_hws = await zhixue_manager.check_new_homeworks(first_id, config_users)
+                        if new_hws:
+                            for item in new_hws:
+                                lines = [f"[新作业] {item['name']}", f"【{username}】"]
+                                for subj, score in (item.get("subjects") or {}).items():
+                                    score_str = f"{score:.1f}" if score is not None else "-"
+                                    lines.append(f"  {subj}: {score_str}")
+                                msg_text = "\n".join(lines)
+                                for binding in bound_ids:
+                                    uid = binding.get("user_id", "")
+                                    pid = binding.get("platform_id", "")
+                                    if uid and pid:
+                                        umo = f"{pid}:FriendMessage:{uid}"
+                                        chain = MessageChain().message(msg_text)
+                                        try:
+                                            await self.context.send_message(umo, chain)
+                                        except Exception as e:
+                                            logger.warning(f"发送通知到 {umo} 失败: {e}")
+                                for group_umo in groups_by_user.get(username, []):
+                                    chain = MessageChain().message(msg_text)
+                                    try:
+                                        await self.context.send_message(group_umo, chain)
+                                    except Exception as e:
+                                        logger.warning(f"发送通知到 {group_umo} 失败: {e}")
+                            logger.info(f"[监听] {username}: 发现 {len(new_hws)} 条新作业")
+                    except Exception as e:
+                        logger.warning(f"[监听] {username} 作业检查失败: {e}")
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -214,6 +246,9 @@ class ZhiXuePlugin(Star):
             "  /zx exams [all]      - 查看考试列表，默认本学年，all 查看全部\n"
             "  /zx marks [序号/名称] - 查看成绩\n"
             "  /zx sheet <学科> [考试] - 查看答题卡(带批改标注长图)\n"
+            "  /zx hw list [all]    - 查看手阅作业列表，all 查看全部\n"
+            "  /zx hw marks [序号/名称] - 查看作业成绩\n"
+            "  /zx hw sheet <学科> [作业] - 查看作业答题卡(带批改标注长图)\n"
             "  /zx watch on [间隔]|off - 开启/停止成绩监听\n"
             "  /zx status           - 查看状态\n"
             "  /zx unbind           - 解绑账号\n"
@@ -272,6 +307,7 @@ class ZhiXuePlugin(Star):
             hint = "" if show_all else "/zx exams all 查看全部学年"
             try:
                 data = {
+                    "title": "EXAM LIST",
                     "year_label": year_label,
                     "hint": hint,
                     "exams": [
@@ -345,6 +381,100 @@ class ZhiXuePlugin(Star):
             yield event.plain_result(str(e))
         except Exception as e:
             yield event.plain_result(f"查询答题卡失败: {e}")
+
+    # -------------------------------------------------------------------
+    # sub command group: /zx hw — 手阅作业（zxbReport 接口）
+    # -------------------------------------------------------------------
+
+    @zx.group("hw")
+    def hw(self):
+        pass
+
+    @hw.command("list")
+    async def hw_list(self, event: AstrMessageEvent, scope: str = None):
+        '''查看手阅作业列表，加 all 查看全部'''
+        show_all = bool(scope) and scope.lower() == "all"
+        yield event.plain_result("正在查询手阅作业列表...")
+        try:
+            config_users = self.config.get("users", [])
+            hws = await zhixue_manager.get_homeworks(event.get_sender_id(), config_users)
+            shown = hws if show_all else hws[:10]
+            hint = "" if show_all else "/zx hw list all 查看全部"
+            try:
+                data = {
+                    "title": "HOMEWORK LIST",
+                    "year_label": "",
+                    "hint": hint,
+                    "exams": [
+                        {
+                            "name": h.get("name", "?"),
+                            "is_final": False,
+                            "date": format_exam_date(h.get("create_time")),
+                        }
+                        for h in shown
+                    ],
+                }
+                url = await self._render_image(EXAMS_TMPL, data)
+                yield event.image_result(url)
+            except Exception as t2i_err:
+                logger.warning(f"t2i渲染失败，降级纯文本: {t2i_err}")
+                yield event.plain_result(format_homeworks_table(hws, show_all=show_all))
+        except ValueError as e:
+            yield event.plain_result(str(e))
+        except Exception as e:
+            yield event.plain_result(f"查询失败: {e}")
+
+    @hw.command("marks")
+    async def hw_marks(self, event: AstrMessageEvent, hw_param: str = None):
+        '''查询手阅作业成绩，可指定作业名或序号'''
+        yield event.plain_result("正在查询作业成绩...")
+        try:
+            config_users = self.config.get("users", [])
+            user_name, hw_info, subjects, total_info = await zhixue_manager.get_homework_marks(
+                event.get_sender_id(), config_users, hw_param
+            )
+            hname = hw_info.get("name", "最新作业")
+            try:
+                data = {
+                    "student_name": user_name,
+                    "exam_name": hname,
+                    "subjects": subjects,
+                    "total_info": total_info,
+                    "has_rank": False,
+                }
+                url = await self._render_image(MARKS_TMPL, data)
+                yield event.image_result(url)
+            except Exception as t2i_err:
+                logger.warning(f"t2i渲染失败，降级纯文本: {t2i_err}")
+                yield event.plain_result(format_marks_table(user_name, hname, subjects, total_info))
+        except ValueError as e:
+            yield event.plain_result(str(e))
+        except Exception as e:
+            yield event.plain_result(f"查询失败: {e}")
+
+    @hw.command("sheet")
+    async def hw_sheet(self, event: AstrMessageEvent, subject_name: str, hw_param: str = None):
+        '''查看手阅作业答题卡(批改标注长图)'''
+        yield event.plain_result(f"正在查询「{subject_name}」作业答题卡并渲染批改标注...")
+        try:
+            config_users = self.config.get("users", [])
+            sheet_name, temp_paths = await zhixue_manager.get_homework_sheet(
+                event.get_sender_id(), config_users, subject_name, hw_param
+            )
+            try:
+                for path in temp_paths:
+                    yield event.image_result(path)
+            finally:
+                import os
+                for path in temp_paths:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        except ValueError as e:
+            yield event.plain_result(str(e))
+        except Exception as e:
+            yield event.plain_result(f"查询作业答题卡失败: {e}")
 
     @zx.command("watch")
     async def zx_watch(self, event: AstrMessageEvent, action: str = "on", interval: int = 5):

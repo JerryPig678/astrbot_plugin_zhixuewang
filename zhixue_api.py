@@ -38,6 +38,11 @@ _GET_PAPER_LEVEL_TREND_URL = f"{_BASE}/zhixuebao/report/paper/getLevelTrend"
 _GET_SUBJECT_DIAGNOSIS = f"{_BASE}/zhixuebao/report/exam/getSubjectDiagnosis"
 _GET_SHEET_URL = f"{_BASE}/zhixuebao/report/checksheet/"
 
+# 手阅作业（zxbReport 系列接口，POST，网页版 UI 无入口但接口开放）
+_HW_LIST_URL = f"{_BASE}/zxbReport/report/getPageAllExamList"
+_HW_REPORT_URL = f"{_BASE}/zxbReport/report/exam/getReportMain"
+_HW_SHEET_URL = f"{_BASE}/zxbReport/report/paper/getCheckSheet"
+
 _MD5_SECRET = "iflytek!@#123student"
 
 # ---------------------------------------------------------------------------
@@ -165,6 +170,27 @@ class StudentAccount:
         self._auth_token = r.json()["result"]
         self._auth_ts = time.time()
         return self._get_auth_header()
+
+    def _ensure_xtoken(self) -> str:
+        """确保 XToken 可用并返回其值（getReportMain/getCheckSheet 的 form 需要带 token）。"""
+        self._get_auth_header()  # 过期时内部会刷新
+        return self._auth_token
+
+    def _post_zxb(self, url: str, data: dict, with_form_token: bool = False) -> dict:
+        """zxbReport 系列 POST 接口（手阅作业）。
+
+        token 必须放请求头（XToken），放 form 只会静默返回空 body；
+        getReportMain/getCheckSheet 另需 form 同时带 token（与服务端行为保持一致）。
+        """
+        form = dict(data)
+        if with_form_token:
+            form["token"] = self._ensure_xtoken()
+        r = self._session.post(url, data=form, headers=self._get_auth_header())
+        r.raise_for_status()
+        resp = r.json()
+        if resp.get("errorCode") != 0:
+            raise RuntimeError(f"{path} 失败: {resp.get('errorInfo')} ({resp.get('errorCode')})")
+        return resp
 
     def _init_base_info(self):
         """Fetch student name, id, etc."""
@@ -308,17 +334,9 @@ class StudentAccount:
         total_raw = result.get("totalScore")
         return papers, total_raw
 
-    def get_sheet_payload(self, exam_id: str, paper_id: str) -> dict | None:
-        """获取答题卡完整数据: 图片 URL + 定位数据 + 分步满分. 无答题卡时返回 None."""
-        r = self._session.get(
-            _GET_SHEET_URL,
-            params={"examId": exam_id, "paperId": paper_id},
-            headers=self._get_auth_header(),
-        )
-        r.raise_for_status()
-        result = r.json().get("result")
-        if not result:
-            return None
+    @staticmethod
+    def _parse_sheet_result(result: dict) -> dict | None:
+        """解析 checksheet/getCheckSheet 的 result 为统一 payload，无答题卡时返回 None."""
         sheet_images_raw = result.get("sheetImages")
         if not sheet_images_raw:
             return None
@@ -335,23 +353,39 @@ class StudentAccount:
             "standard_score": result.get("standardScore"),
         }
 
+    def get_sheet_payload(self, exam_id: str, paper_id: str) -> dict | None:
+        """获取答题卡完整数据: 图片 URL + 定位数据 + 分步满分. 无答题卡时返回 None."""
+        r = self._session.get(
+            _GET_SHEET_URL,
+            params={"examId": exam_id, "paperId": paper_id},
+            headers=self._get_auth_header(),
+        )
+        r.raise_for_status()
+        result = r.json().get("result")
+        if not result:
+            return None
+        return self._parse_sheet_result(result)
+
     def get_sheet_images(self, exam_id: str, paper_id: str) -> list[str]:
         """获取答题卡图片 URL 列表。"""
         payload = self.get_sheet_payload(exam_id, paper_id)
         return payload["image_urls"] if payload else []
 
     def download_sheet_images(self, exam_id: str, paper_id: str, title: str = "") -> list[str]:
-        """下载答题卡图片(批注渲染+总分栏+拼接长图)到临时文件，返回路径列表。调用方负责清理。"""
+        """下载考试答题卡图片(批注渲染+总分栏+拼接长图)到临时文件，返回路径列表。调用方负责清理。"""
+        payload = self.get_sheet_payload(exam_id, paper_id)
+        if not payload:
+            return []
+        return self.render_sheet_images(payload, title)
+
+    def render_sheet_images(self, payload: dict, title: str = "") -> list[str]:
+        """按 payload（考试或手阅作业的 checksheet 数据）渲染批注长图到临时文件。调用方负责清理。"""
         import io
         import tempfile
 
         from PIL import Image
 
         from .answer_sheet import add_score_bar, annotate_page, build_score_map
-
-        payload = self.get_sheet_payload(exam_id, paper_id)
-        if not payload:
-            return []
 
         raw_pages = []
         for url in payload["image_urls"]:
@@ -395,6 +429,60 @@ class StudentAccount:
             tmp.close()
             temp_paths.append(tmp.name)
         return temp_paths
+
+    # ------------------------------------------------------------------
+    # 手阅作业（zxbReport 系列，网页版无入口，详见 zhixuewang_http docs/shouyue_homework_api.md）
+    # ------------------------------------------------------------------
+
+    def get_homework_list(self, page: int = 1, page_size: int = 20) -> tuple[list, bool]:
+        """手阅/作业列表。返回 (homeworks, has_next_page)。
+
+        homeworks 元素: {id, name, score, create_time(毫秒)}
+        """
+        resp = self._post_zxb(_HW_LIST_URL, {
+            "reportType": "homework",
+            "pageIndex": page,
+            "pageSize": page_size,
+            "actualPosition": 0,
+        })
+        result = resp.get("result") or {}
+        items = []
+        for e in result.get("examInfoList") or []:
+            items.append({
+                "id": e.get("examId", ""),
+                "name": e.get("examName", ""),
+                "score": e.get("score"),
+                "create_time": e.get("examCreateDateTime", 0) or 0,
+            })
+        return items, bool(result.get("hasNextPage"))
+
+    def get_homework_report_main(self, exam_id: str) -> list:
+        """手阅作业报告主页 -> paperList（与 get_report_main 的 papers 同结构）。"""
+        resp = self._post_zxb(
+            _HW_REPORT_URL, {"examId": exam_id}, with_form_token=True
+        )
+        papers = []
+        for p in (resp.get("result") or {}).get("paperList") or []:
+            papers.append({
+                "paper_id": p["paperId"],
+                "subject_name": p["subjectName"],
+                "subject_code": p.get("subjectCode", ""),
+                "score": p.get("userScore"),
+                "standard_score": p.get("standardScore"),
+            })
+        return papers
+
+    def get_homework_sheet_payload(self, exam_id: str, paper_id: str) -> dict | None:
+        """手阅作业答题卡数据（与 get_sheet_payload 同结构）。无答题卡时返回 None。"""
+        resp = self._post_zxb(
+            _HW_SHEET_URL,
+            {"examId": exam_id, "paperId": paper_id},
+            with_form_token=True,
+        )
+        result = resp.get("result")
+        if not result:
+            return None
+        return self._parse_sheet_result(result)
 
     def _set_exam_rank(self, exam: Exam, mark: Mark):
         """Fetch rank info and populate class_rank on each SubjectScore."""
